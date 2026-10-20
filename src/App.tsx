@@ -216,7 +216,7 @@ const extractMonthAndDay = (dateStr: string): { month: number | null; day: numbe
  * yearMonth の一致に加え、date 文字列内の「月」も一致しているか二重チェックすることで他月データの混入を完全に防ぐ
  */
 const isStrictMatchingYearMonth = (
-  item: DailyDataItem,
+  item: DailyDataItem | SolarIntervalRecord,
   year: string | number,
   month: string | number
 ): boolean => {
@@ -242,7 +242,10 @@ const isStrictMatchingYearMonth = (
 /**
  * 日次データが指定された年（selectedYear）に一致し、かつ date の月と yearMonth の月が整合しているかを判定する関数
  */
-const isStrictMatchingYear = (item: DailyDataItem, year: string | number): boolean => {
+const isStrictMatchingYear = (
+  item: DailyDataItem | SolarIntervalRecord,
+  year: string | number
+): boolean => {
   const yNum = Number(year);
   if (isNaN(yNum)) return false;
 
@@ -264,6 +267,83 @@ const isStrictMatchingYear = (item: DailyDataItem, year: string | number): boole
 /**
  * FileReader を Promise でラップして非同期にファイルを読み込む関数
  */
+/**
+ * 15分値レコード（timestamp を保持）かどうかを判定する型ガード関数
+ */
+export const isIntervalRecord = (
+  item: SolarIntervalRecord | DailyDataItem
+): item is SolarIntervalRecord => {
+  return 'timestamp' in item;
+};
+
+/**
+ * allDailyData（15分値レコードまたは日次データ）から、全期間の日次集計データを生成するヘルパー関数
+ */
+export const getAllAggregatedDailyData = (
+  records: (SolarIntervalRecord | DailyDataItem)[]
+): DailyDataItem[] => {
+  const intervals = records.filter(isIntervalRecord);
+  const dailies = records.filter((r): r is DailyDataItem => !isIntervalRecord(r));
+
+  if (intervals.length === 0) {
+    return dailies;
+  }
+
+  const aggMap = new Map<
+    string,
+    {
+      yearMonth: string;
+      date: string;
+      day: number;
+      generation: number;
+      consumption: number;
+      solarFrom: number;
+      gridFrom: number;
+      sunlight: number;
+    }
+  >();
+
+  for (const rec of intervals) {
+    const { day } = extractMonthAndDay(rec.date);
+    const key = `${rec.yearMonth}_${rec.date}`;
+    const prev = aggMap.get(key) || {
+      yearMonth: rec.yearMonth,
+      date: rec.date,
+      day: day ?? 0,
+      generation: 0,
+      consumption: 0,
+      solarFrom: 0,
+      gridFrom: 0,
+      sunlight: 0,
+    };
+    prev.generation += rec.generation;
+    prev.consumption += rec.consumption;
+    prev.solarFrom += rec.solarFrom;
+    prev.gridFrom += rec.gridFrom;
+    if (rec.sunlight > 0) prev.sunlight = rec.sunlight;
+    aggMap.set(key, prev);
+  }
+
+  const intervalDailies: DailyDataItem[] = Array.from(aggMap.values())
+    .sort((a, b) => a.day - b.day)
+    .map((d) => ({
+      yearMonth: d.yearMonth,
+      date: d.date,
+      generation: Math.round(d.generation),
+      consumption: Math.round(d.consumption),
+      solarFrom: Math.round(d.solarFrom),
+      gridFrom: Math.round(d.gridFrom),
+      sunlight: d.sunlight,
+    }));
+
+  const existingKeys = new Set(intervalDailies.map((d) => `${d.yearMonth}_${d.date}`));
+  const remainingDailies = dailies.filter(
+    (d) => !existingKeys.has(`${d.yearMonth}_${d.date}`)
+  );
+
+  return [...intervalDailies, ...remainingDailies];
+};
+
 const readFileAsText = (file: File): Promise<{ fileName: string; text: string }> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -285,7 +365,7 @@ export default function App() {
   const [selectedMonth, setSelectedMonth] = useState('6');
 
   const [monthlyData, setMonthlyData] = useState<MonthlyDataItem[]>([]);
-  const [allDailyData, setAllDailyData] = useState<DailyDataItem[]>([]);
+  const [allDailyData, setAllDailyData] = useState<(SolarIntervalRecord | DailyDataItem)[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -347,6 +427,16 @@ export default function App() {
    * 3. 対象年月（targetYear, targetMonth）を判定し、気象庁API (/api/weather) から牛深観測所の日照時間を取得して統合
    * 4. バックエンド (/api/solar) へ POST 送信
    */
+  /**
+   * 複数の週次15分値CSV（単位: kW）を一括読み込みし、
+   * 1. Promise.all + FileReader で全ファイルを非同期読み込み、ダブルクォーテーション内のカンマを無視して安全にパース
+   * 2. ヘッダー検出（測定時間, 発電 (kW), 建物へ (kW), 系統へ (kW), 消費 (kW), 太陽光から (kW), 系統から (kW)）
+   *    取得値 (kW) を 4 で割って電力量 (kWh) に変換 (kW / 4)
+   * 3. 測定時間を標準日時に変換し、yearMonth（例: "2026年9月"）と date（例: "9月30日"）を付与
+   * 4. 時系列ソート＆重複排除（同じ測定時間の行をユニーク化）
+   * 5. 月またぎデータの自動仕分け：全年月をグループ化し、各年月の気象庁日照時間取得・日次集計・月次算出・バックエンド保存
+   * 6. 結合・重複排除された全データをステート（allDailyData）に保存
+   */
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const fileList = e.target.files;
     if (!fileList || fileList.length === 0) return;
@@ -366,8 +456,8 @@ export default function App() {
       const rawIntervalRows: Array<
         SolarIntervalRecord & {
           epochMs: number;
-          yearStr: string;
-          monthStr: string;
+          year: number;
+          month: number;
           day: number;
         }
       > = [];
@@ -385,7 +475,23 @@ export default function App() {
           continue;
         }
 
-        const headers = parseCSVLine(lines[0]).map((h) => h.replace(/^\uFEFF/, '').trim());
+        // ヘッダー行を探す（'測定時間' を含む行）
+        let headerLineIdx = -1;
+        for (let i = 0; i < Math.min(lines.length, 10); i++) {
+          if (lines[i].includes('測定時間')) {
+            headerLineIdx = i;
+            break;
+          }
+        }
+
+        if (headerLineIdx === -1) {
+          console.warn(`⚠️ ファイル "${fileName}" に『測定時間』ヘッダーが見つかりませんでした。`);
+          continue;
+        }
+
+        const headers = parseCSVLine(lines[headerLineIdx]).map((h) =>
+          h.replace(/^\uFEFF/, '').trim()
+        );
 
         const timeIdx = headers.indexOf('測定時間');
         const genKwIdx = headers.indexOf('発電 (kW)');
@@ -395,38 +501,32 @@ export default function App() {
         const solarKwIdx = headers.indexOf('太陽光から (kW)');
         const gridFromKwIdx = headers.indexOf('系統から (kW)');
 
-        if (timeIdx === -1) {
-          throw new Error(
-            `ファイル "${fileName}" に『測定時間』ヘッダーが見つかりません。\n検出ヘッダー: ${headers.join(', ')}`
-          );
-        }
-
-        for (let i = 1; i < lines.length; i++) {
+        for (let i = headerLineIdx + 1; i < lines.length; i++) {
           const cols = parseCSVLine(lines[i]);
           if (cols.length <= timeIdx) continue;
 
           const parsedTime = parseMeasurementTime(cols[timeIdx]);
           if (!parsedTime) continue;
 
-          // 15分間の平均電力 (kW) を 4 で割って電力量 (kWh) に変換 (value * 0.25)
+          // 取得値 (kW) を 4 で割って電力量 (kWh) に変換 (kW / 4)
           const generation =
-            genKwIdx !== -1 ? parseNumberValue(cols[genKwIdx]) * 0.25 : 0;
+            genKwIdx !== -1 ? parseNumberValue(cols[genKwIdx]) / 4 : 0;
           const toBuilding =
-            toBuildingKwIdx !== -1 ? parseNumberValue(cols[toBuildingKwIdx]) * 0.25 : 0;
+            toBuildingKwIdx !== -1 ? parseNumberValue(cols[toBuildingKwIdx]) / 4 : 0;
           const toGrid =
-            toGridKwIdx !== -1 ? parseNumberValue(cols[toGridKwIdx]) * 0.25 : 0;
+            toGridKwIdx !== -1 ? parseNumberValue(cols[toGridKwIdx]) / 4 : 0;
           const consumption =
-            consKwIdx !== -1 ? parseNumberValue(cols[consKwIdx]) * 0.25 : 0;
+            consKwIdx !== -1 ? parseNumberValue(cols[consKwIdx]) / 4 : 0;
           const solarFrom =
-            solarKwIdx !== -1 ? parseNumberValue(cols[solarKwIdx]) * 0.25 : 0;
+            solarKwIdx !== -1 ? parseNumberValue(cols[solarKwIdx]) / 4 : 0;
           const gridFrom =
-            gridFromKwIdx !== -1 ? parseNumberValue(cols[gridFromKwIdx]) * 0.25 : 0;
+            gridFromKwIdx !== -1 ? parseNumberValue(cols[gridFromKwIdx]) / 4 : 0;
 
           rawIntervalRows.push({
             timestamp: parsedTime.timestamp,
             epochMs: parsedTime.epochMs,
-            yearStr: parsedTime.yearStr,
-            monthStr: parsedTime.monthStr,
+            year: parsedTime.year,
+            month: parsedTime.month,
             day: parsedTime.day,
             yearMonth: parsedTime.yearMonth,
             date: parsedTime.dateLabel,
@@ -449,30 +549,16 @@ export default function App() {
       // 3. 測定時間の古い順（時系列順）にソート
       rawIntervalRows.sort((a, b) => a.epochMs - b.epochMs);
 
-      // 4. 週をまたぐ際の重複行を排除（ユニーク化）
+      // 4. 重複行（同じ測定時間の行）を排除（ユニーク化）
       const uniqueIntervalMap = new Map<
         string,
-        SolarIntervalRecord & { yearStr: string; monthStr: string; day: number }
+        SolarIntervalRecord & { year: number; month: number; day: number; epochMs: number }
       >();
 
       for (const row of rawIntervalRows) {
         const existing = uniqueIntervalMap.get(row.timestamp);
         if (!existing) {
-          uniqueIntervalMap.set(row.timestamp, {
-            timestamp: row.timestamp,
-            yearMonth: row.yearMonth,
-            date: row.date,
-            generation: row.generation,
-            toBuilding: row.toBuilding,
-            toGrid: row.toGrid,
-            consumption: row.consumption,
-            solarFrom: row.solarFrom,
-            gridFrom: row.gridFrom,
-            sunlight: row.sunlight,
-            yearStr: row.yearStr,
-            monthStr: row.monthStr,
-            day: row.day,
-          });
+          uniqueIntervalMap.set(row.timestamp, row);
         } else {
           uniqueIntervalMap.set(row.timestamp, {
             ...existing,
@@ -486,194 +572,210 @@ export default function App() {
         }
       }
 
-      const mergedWithMeta = Array.from(uniqueIntervalMap.values());
+      const mergedUniqueIntervals = Array.from(uniqueIntervalMap.values());
 
-      // 5. インポートされたデータが属する主要年月（targetYear, targetMonth）を判定
-      // （週次CSVで前月末・翌月初が数日分含まれていても、最もデータ行数が多い年月を対象月とする）
-      const ymCountMap = new Map<string, { count: number; yearStr: string; monthStr: string }>();
-      for (const item of mergedWithMeta) {
-        const prev = ymCountMap.get(item.yearMonth);
-        ymCountMap.set(item.yearMonth, {
+      // 5. 月またぎデータの自動仕分け：含まれるすべての年月（yearMonth）をグループ化
+      const ymGroupMap = new Map<string, { year: number; month: number; count: number }>();
+      for (const item of mergedUniqueIntervals) {
+        const prev = ymGroupMap.get(item.yearMonth);
+        ymGroupMap.set(item.yearMonth, {
+          year: item.year,
+          month: item.month,
           count: (prev?.count || 0) + 1,
-          yearStr: item.yearStr,
-          monthStr: item.monthStr,
         });
       }
 
-      let targetYear = mergedWithMeta[0].yearStr;
-      let targetMonth = mergedWithMeta[0].monthStr;
+      // 代表年月（最も行数が多い年月）を判定
+      let primaryYear = mergedUniqueIntervals[0].year;
+      let primaryMonth = mergedUniqueIntervals[0].month;
       let maxCount = 0;
-      for (const [, info] of ymCountMap.entries()) {
+      for (const [, info] of ymGroupMap.entries()) {
         if (info.count > maxCount) {
           maxCount = info.count;
-          targetYear = info.yearStr;
-          targetMonth = info.monthStr;
+          primaryYear = info.year;
+          primaryMonth = info.month;
         }
       }
 
-      if (!targetYear || !targetMonth) {
-        alert('エラー：CSVから年月を正しく読み取れませんでした。データ形式をご確認ください。');
-        return;
-      }
+      // 6. 各年月ごとに気象庁APIから日照時間を取得、日次集計、バックエンドPOST
+      const updatedMonthlyItems: MonthlyDataItem[] = [];
+      const importedMonths: string[] = [];
 
-      const targetYearMonth = `${targetYear}年${targetMonth}月`;
+      for (const [ym, info] of ymGroupMap.entries()) {
+        importedMonths.push(ym);
+        const { year: targetY, month: targetM } = info;
 
-      // 対象月（targetYear, targetMonth）に属する15分値データのみに絞り込み（他月の端数日の混入を防止）
-      const targetMonthIntervalsWithMeta = mergedWithMeta.filter(
-        (r) => r.yearStr === targetYear && r.monthStr === targetMonth
-      );
-
-      // 日次データへの集計（対象月のみを厳格に集計）
-      const dailyAggMap = new Map<
-        string,
-        {
-          yearMonth: string;
-          date: string;
-          day: number;
-          generation: number;
-          consumption: number;
-          solarFrom: number;
-          gridFrom: number;
-        }
-      >();
-
-      for (const rec of targetMonthIntervalsWithMeta) {
-        const key = `${rec.yearMonth}_${rec.date}`;
-        const prev = dailyAggMap.get(key) || {
-          yearMonth: rec.yearMonth,
-          date: rec.date,
-          day: rec.day,
-          generation: 0,
-          consumption: 0,
-          solarFrom: 0,
-          gridFrom: 0,
-        };
-        prev.generation += rec.generation;
-        prev.consumption += rec.consumption;
-        prev.solarFrom += rec.solarFrom;
-        prev.gridFrom += rec.gridFrom;
-        dailyAggMap.set(key, prev);
-      }
-
-      const parsedDailyData: DailyDataItem[] = Array.from(dailyAggMap.values())
-        .sort((a, b) => a.day - b.day)
-        .map((d) => ({
-          yearMonth: d.yearMonth,
-          date: d.date,
-          generation: Math.round(d.generation),
-          consumption: Math.round(d.consumption),
-          solarFrom: Math.round(d.solarFrom),
-          gridFrom: Math.round(d.gridFrom),
-          sunlight: 0,
-        }));
-
-      // 6. 気象庁API連携（牛深観測所の日照時間データを取得して統合）
-      try {
-        console.log(
-          `☀️ 気象庁APIから日照時間を取得中... (/api/weather?year=${targetYear}&month=${targetMonth})`
-        );
-        const weatherRes = await fetch(
-          `/api/weather?year=${targetYear}&month=${targetMonth}`
-        );
-        if (weatherRes.ok) {
-          const sunshineData: Record<string, number> = await weatherRes.json();
-          console.log('☀️ 取得した日照時間データ:', sunshineData);
-
-          // 日次集計データの該当日に日照時間をマッピング
-          parsedDailyData.forEach((d) => {
-            const { day } = extractMonthAndDay(d.date);
-            if (day !== null && sunshineData[day] !== undefined) {
-              d.sunlight = sunshineData[day];
-            }
-          });
-
-          // 結合済み15分値データの該当日に日照時間をマッピング
-          targetMonthIntervalsWithMeta.forEach((r) => {
-            if (sunshineData[r.day] !== undefined) {
-              r.sunlight = sunshineData[r.day];
-            }
-          });
-        } else {
-          console.warn(
-            `⚠️ 気象庁データの取得に失敗しました (HTTP ${weatherRes.status})`
+        // 気象庁API連携（日照時間）
+        let sunshineMap: Record<number, number> = {};
+        try {
+          console.log(
+            `☀️ 気象庁APIから日照時間を取得中... (/api/weather?year=${targetY}&month=${targetM})`
           );
+          const weatherRes = await fetch(
+            `/api/weather?year=${targetY}&month=${targetM}`
+          );
+          if (weatherRes.ok) {
+            sunshineMap = await weatherRes.json();
+            console.log(`☀️ [${ym}] 取得した日照時間データ:`, sunshineMap);
+          } else {
+            console.warn(
+              `⚠️ [${ym}] 気象庁データの取得に失敗しました (HTTP ${weatherRes.status})`
+            );
+          }
+        } catch (weatherErr) {
+          console.warn(`⚠️ [${ym}] 気象庁データの取得に失敗しました:`, weatherErr);
         }
-      } catch (weatherErr) {
-        console.warn('⚠️ 気象庁データの取得に失敗しました:', weatherErr);
+
+        // 該当する年月の15分値レコードに日照時間を付与
+        const monthIntervals = mergedUniqueIntervals.filter((r) => r.yearMonth === ym);
+        monthIntervals.forEach((r) => {
+          if (sunshineMap[r.day] !== undefined) {
+            r.sunlight = sunshineMap[r.day];
+          }
+        });
+
+        // 日次集計データ算出
+        const monthDailyAggMap = new Map<
+          string,
+          {
+            yearMonth: string;
+            date: string;
+            day: number;
+            generation: number;
+            consumption: number;
+            solarFrom: number;
+            gridFrom: number;
+            sunlight: number;
+          }
+        >();
+
+        for (const rec of monthIntervals) {
+          const key = rec.date;
+          const prev = monthDailyAggMap.get(key) || {
+            yearMonth: rec.yearMonth,
+            date: rec.date,
+            day: rec.day,
+            generation: 0,
+            consumption: 0,
+            solarFrom: 0,
+            gridFrom: 0,
+            sunlight: 0,
+          };
+          prev.generation += rec.generation;
+          prev.consumption += rec.consumption;
+          prev.solarFrom += rec.solarFrom;
+          prev.gridFrom += rec.gridFrom;
+          if (rec.sunlight > 0) prev.sunlight = rec.sunlight;
+          monthDailyAggMap.set(key, prev);
+        }
+
+        const monthDailyData: DailyDataItem[] = Array.from(monthDailyAggMap.values())
+          .sort((a, b) => a.day - b.day)
+          .map((d) => ({
+            yearMonth: d.yearMonth,
+            date: d.date,
+            generation: Math.round(d.generation),
+            consumption: Math.round(d.consumption),
+            solarFrom: Math.round(d.solarFrom),
+            gridFrom: Math.round(d.gridFrom),
+            sunlight: d.sunlight,
+          }));
+
+        const totalGenKwh = Math.round(
+          monthDailyData.reduce((sum, d) => sum + d.generation, 0)
+        );
+        const totalConsKwh = monthDailyData.reduce((sum, d) => sum + d.consumption, 0);
+        const totalSolarKwh = monthDailyData.reduce((sum, d) => sum + d.solarFrom, 0);
+        const selfSufficiency =
+          totalConsKwh > 0
+            ? parseFloat(((totalSolarKwh / totalConsKwh) * 100).toFixed(1))
+            : 0;
+
+        updatedMonthlyItems.push({
+          month: ym,
+          actual: totalGenKwh,
+          selfSufficiency,
+        });
+
+        // バックエンド (/api/solar) へ POST 送信
+        try {
+          const cleanIntervals: SolarIntervalRecord[] = monthIntervals.map(
+            ({ year: _y, month: _m, day: _d, epochMs: _e, ...rec }) => rec
+          );
+          const payload = {
+            month: ym,
+            actual: totalGenKwh,
+            selfSufficiency,
+            dailyData: monthDailyData,
+            intervalData: cleanIntervals,
+          };
+          const res = await fetch('/api/solar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          if (res.ok) {
+            console.log(`🚀 [${ym}] /api/solar POST 送信完了`);
+          }
+        } catch (postErr) {
+          console.warn(`⚠️ [${ym}] /api/solar POST 送信エラー:`, postErr);
+        }
       }
 
-      const mergedIntervalData: SolarIntervalRecord[] = targetMonthIntervalsWithMeta.map(
-        ({ yearStr: _y, monthStr: _m, day: _d, ...record }) => record
+      // 7. ステート（allDailyData）の更新
+      // 指示2: 結合・重複排除された全データをステート（allDailyData）に保存する
+      const cleanAllIntervals: SolarIntervalRecord[] = mergedUniqueIntervals.map(
+        ({ year: _y, month: _m, day: _d, epochMs: _e, ...rec }) => rec
       );
 
-      const totalGenKwh = Math.round(
-        mergedIntervalData.reduce((sum, r) => sum + r.generation, 0)
-      );
-      const totalConsKwh = mergedIntervalData.reduce((sum, r) => sum + r.consumption, 0);
-      const totalSolarKwh = mergedIntervalData.reduce((sum, r) => sum + r.solarFrom, 0);
-      const selfSufficiency =
-        totalConsKwh > 0 ? parseFloat(((totalSolarKwh / totalConsKwh) * 100).toFixed(1)) : 0;
-
-      console.log('✅ 15分値CSV パース・ソート・重複排除・日照時間統合完了:', {
-        対象年月: targetYearMonth,
-        読み込みファイル数: files.length,
-        全ファイル結合行数: rawIntervalRows.length,
-        対象月ユニーク15分値件数: mergedIntervalData.length,
-        対象月日次データ日数: parsedDailyData.length,
-        月間総発電量_kWh: totalGenKwh,
-        電力自給率_pct: selfSufficiency,
-      });
-      console.log('📊 結合済み15分値データ (kWh, 日照時間統合済):', mergedIntervalData);
-      console.log('📅 日次集計データ (kWh, 日照時間統合済):', parsedDailyData);
-
-      // 7. バックエンド (/api/solar) へ POST 送信
-      const payload = {
-        month: targetYearMonth,
-        actual: totalGenKwh,
-        selfSufficiency,
-        dailyData: parsedDailyData,
-        intervalData: mergedIntervalData,
-      };
-
-      const res = await fetch('/api/solar', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        throw new Error('データ保存失敗');
-      }
-
-      const postResult = await res.json();
-      console.log('🚀 /api/solar POST 送信結果:', postResult);
-
-      // 画面側のステートを更新（他月のデータを汚さず、対象月のデータのみを正確に反映）
       setAllDailyData((prev) => {
-        const filteredPrev = prev.filter(
-          (item) => !isStrictMatchingYearMonth(item, targetYear, targetMonth)
-        );
-        return [...filteredPrev, ...parsedDailyData];
-      });
-
-      setMonthlyData((prev) => {
-        const exists = prev.some((m) => m.month === targetYearMonth);
-        if (exists) {
-          return prev.map((m) =>
-            m.month === targetYearMonth
-              ? { ...m, actual: totalGenKwh, selfSufficiency }
-              : m
-          );
+        const intervalMap = new Map<string, SolarIntervalRecord>();
+        for (const item of prev) {
+          if (isIntervalRecord(item)) {
+            intervalMap.set(item.timestamp, item);
+          }
         }
-        return [...prev, { month: targetYearMonth, actual: totalGenKwh, selfSufficiency }];
+        for (const item of cleanAllIntervals) {
+          intervalMap.set(item.timestamp, item);
+        }
+        const mergedIntervals = Array.from(intervalMap.values()).sort((a, b) =>
+          a.timestamp.localeCompare(b.timestamp)
+        );
+
+        const importedYmSet = new Set(importedMonths);
+        const remainingDailies = prev.filter(
+          (item): item is DailyDataItem =>
+            !isIntervalRecord(item) && !importedYmSet.has(item.yearMonth)
+        );
+
+        return [...mergedIntervals, ...remainingDailies];
       });
 
-      setSelectedYear(targetYear);
-      setSelectedMonth(targetMonth);
+      // monthlyData の更新
+      setMonthlyData((prev) => {
+        const next = [...prev];
+        for (const u of updatedMonthlyItems) {
+          const idx = next.findIndex((m) => m.month === u.month);
+          if (idx >= 0) {
+            next[idx] = {
+              ...next[idx],
+              actual: u.actual,
+              selfSufficiency: u.selfSufficiency,
+            };
+          } else {
+            next.push(u);
+          }
+        }
+        return next;
+      });
+
+      setSelectedYear(String(primaryYear));
+      setSelectedMonth(String(primaryMonth));
 
       alert(
-        `🎉 インポート成功！\n\n気象庁のデータベースから牛深周辺の実測日照時間を自動取得し、${targetYearMonth}のデータ（${parsedDailyData.length}日分 / 15分値 ${mergedIntervalData.length}件）に統合しました。`
-      );
+        `🎉 インポート成功！\n\n${files.length}件のCSVファイルを読み込み、月またぎデータ（${importedMonths.join(
+          '、'
+        )}）を仕分けて統合しました。\n合計 ${cleanAllIntervals.length} 件の15分値データを反映しました。`);
     } catch (err) {
       console.error('❌ CSVインポートエラー:', err);
       alert('スプレッドシートへの保存またはCSV解析中にエラーが発生しました。');
@@ -686,23 +788,99 @@ export default function App() {
   const currentTargetStr = `${selectedYear}年${selectedMonth}月`;
   const lastYearStr = String(Number(selectedYear) - 1);
 
+  // 指示2: 画面に表示するグラフ用データは、現在画面のプルダウンで選択されている年・月に yearMonth が一致するデータのみを filter で抽出すること
+  const currentMonthRecords = allDailyData.filter((item) =>
+    isStrictMatchingYearMonth(item, selectedYear, selectedMonth)
+  );
+
+  // 指示3: 上記の15分値データをもとに、選択月の日別（1日〜末日）の「日次集計データ（各項目の合計値）」を算出する
+  const currentMonthIntervals = currentMonthRecords.filter(isIntervalRecord);
+
+  let dailyData: DailyDataItem[] = [];
+  if (currentMonthIntervals.length > 0) {
+    const dailyAggMap = new Map<
+      string,
+      {
+        yearMonth: string;
+        date: string;
+        day: number;
+        generation: number;
+        consumption: number;
+        solarFrom: number;
+        gridFrom: number;
+        sunlight: number;
+      }
+    >();
+
+    for (const rec of currentMonthIntervals) {
+      const { day } = extractMonthAndDay(rec.date);
+      const dayNum = day ?? 0;
+      const key = rec.date;
+      const prev = dailyAggMap.get(key) || {
+        yearMonth: rec.yearMonth,
+        date: rec.date,
+        day: dayNum,
+        generation: 0,
+        consumption: 0,
+        solarFrom: 0,
+        gridFrom: 0,
+        sunlight: 0,
+      };
+      prev.generation += rec.generation;
+      prev.consumption += rec.consumption;
+      prev.solarFrom += rec.solarFrom;
+      prev.gridFrom += rec.gridFrom;
+      if (rec.sunlight > 0) {
+        prev.sunlight = rec.sunlight;
+      }
+      dailyAggMap.set(key, prev);
+    }
+
+    dailyData = Array.from(dailyAggMap.values())
+      .sort((a, b) => a.day - b.day)
+      .map((d) => ({
+        yearMonth: d.yearMonth,
+        date: d.date,
+        generation: Math.round(d.generation),
+        consumption: Math.round(d.consumption),
+        solarFrom: Math.round(d.solarFrom),
+        gridFrom: Math.round(d.gridFrom),
+        sunlight: d.sunlight,
+      }));
+  } else {
+    // 15分値データがない場合（スプレッドシート等から取得した日次データのみの場合）のフォールバック
+    dailyData = currentMonthRecords
+      .filter((d): d is DailyDataItem => !isIntervalRecord(d))
+      .sort((a, b) => {
+        const dayA = extractMonthAndDay(a.date).day ?? 0;
+        const dayB = extractMonthAndDay(b.date).day ?? 0;
+        return dayA - dayB;
+      });
+  }
+
+  // 全期間の日次集計データ（月次タブ、年間相関図、前年同月比較等で使用）
+  const aggregatedAllDailyData = getAllAggregatedDailyData(allDailyData);
+
   // 選択された年（selectedYear）に属するデータのみを厳格にフィルター
-  const dailyDataThisYear = allDailyData.filter((d) =>
+  const dailyDataThisYear = aggregatedAllDailyData.filter((d) =>
     isStrictMatchingYear(d, selectedYear)
   );
 
-  // 【修正1】現在プルダウンで選択されている年・月（selectedYear, selectedMonth）に一致するデータのみを厳格にフィルター＆日付順ソート
-  const dailyData = allDailyData
-    .filter((d) => isStrictMatchingYearMonth(d, selectedYear, selectedMonth))
-    .sort((a, b) => {
-      const dayA = extractMonthAndDay(a.date).day ?? 0;
-      const dayB = extractMonthAndDay(b.date).day ?? 0;
-      return dayA - dayB;
-    });
-
-  const maxDailyConsumption = Math.max(0, ...dailyDataThisYear.map((d) => d.consumption));
-  const maxDailyGeneration = Math.max(0, ...dailyDataThisYear.map((d) => d.generation));
-  const maxDailySunlight = Math.max(0, ...dailyDataThisYear.map((d) => d.sunlight));
+  const maxDailyConsumption = Math.max(
+    0,
+    ...dailyDataThisYear.map((d) => d.consumption),
+    ...dailyData.map((d) => d.consumption)
+  );
+  const maxDailyGeneration = Math.max(
+    0,
+    ...dailyDataThisYear.map((d) => d.generation),
+    ...dailyData.map((d) => d.generation)
+  );
+  const maxDailySunlight = Math.max(
+    0,
+    ...dailyDataThisYear.map((d) => d.sunlight),
+    ...dailyData.map((d) => d.sunlight)
+  );
 
   const yMaxCons = maxDailyConsumption > 0 ? Math.ceil(maxDailyConsumption * 1.1) : 'auto';
   const yMaxGen = maxDailyGeneration > 0 ? Math.ceil(maxDailyGeneration * 1.1) : 'auto';
@@ -722,10 +900,10 @@ export default function App() {
   let maxMonthlyOverall = 0;
   for (let m = 1; m <= 12; m++) {
     const tData = aggregate(
-      allDailyData.filter((d) => isStrictMatchingYearMonth(d, selectedYear, m))
+      aggregatedAllDailyData.filter((d) => isStrictMatchingYearMonth(d, selectedYear, m))
     );
     const lData = aggregate(
-      allDailyData.filter((d) => isStrictMatchingYearMonth(d, lastYearStr, m))
+      aggregatedAllDailyData.filter((d) => isStrictMatchingYearMonth(d, lastYearStr, m))
     );
     const maxInMonth = Math.max(
       tData.generation,
@@ -743,7 +921,7 @@ export default function App() {
 
   const monthlyChartDataExtended = Array.from({ length: 12 }, (_, i) => {
     const monthNum = i + 1;
-    const monthDailies = allDailyData.filter((d) =>
+    const monthDailies = aggregatedAllDailyData.filter((d) =>
       isStrictMatchingYearMonth(d, selectedYear, monthNum)
     );
 
@@ -835,7 +1013,7 @@ export default function App() {
   });
 
   const rawDailyThisYear = dailyData;
-  const rawDailyLastYear = allDailyData.filter((d) =>
+  const rawDailyLastYear = aggregatedAllDailyData.filter((d) =>
     isStrictMatchingYearMonth(d, lastYearStr, selectedMonth)
   );
 
@@ -851,15 +1029,33 @@ export default function App() {
 
   const currentTarget = monthlyData.find((d) => d.month === currentTargetStr);
 
+  const currentGenTotal = dailyData.reduce((sum, d) => sum + d.generation, 0);
+  const currentConsTotal = dailyData.reduce((sum, d) => sum + d.consumption, 0);
+  const currentSolarTotal = dailyData.reduce((sum, d) => sum + d.solarFrom, 0);
+  const calculatedSelfSufficiency =
+    currentConsTotal > 0 ? (currentSolarTotal / currentConsTotal) * 100 : 0;
+
   const displayActual =
     currentTarget && currentTarget.actual !== null
       ? (currentTarget.actual / 1000).toFixed(2)
+      : dailyData.length > 0
+      ? (currentGenTotal / 1000).toFixed(2)
       : '0.00';
-  const displaySufficiency = currentTarget ? currentTarget.selfSufficiency.toFixed(1) : '0.0';
+  const displaySufficiency = currentTarget
+    ? currentTarget.selfSufficiency.toFixed(1)
+    : dailyData.length > 0
+    ? calculatedSelfSufficiency.toFixed(1)
+    : '0.0';
   const currentSimValue = SIMULATION_DATA[parseInt(selectedMonth, 10)];
+  const actualForRatio =
+    currentTarget && currentTarget.actual !== null
+      ? currentTarget.actual
+      : dailyData.length > 0
+      ? currentGenTotal
+      : null;
   const displayRatio =
-    currentTarget && currentTarget.actual !== null && currentSimValue > 0
-      ? ((currentTarget.actual / currentSimValue - 1) * 100).toFixed(1)
+    actualForRatio !== null && currentSimValue > 0
+      ? ((actualForRatio / currentSimValue - 1) * 100).toFixed(1)
       : '0.0';
 
   const roiData = [
