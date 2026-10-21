@@ -44,6 +44,360 @@ interface DailyDataItem {
   sunlight: number;
 }
 
+export interface ElectricityRate {
+  id: string;
+  startDate: string; // 適用開始日 "YYYY-MM-DD"
+  summerPeakRate: number; // 夏季ピーク(円/kWh, 7/1〜9/30の平日 13:00〜16:00)
+  summerDayRate: number; // 夏季昼間(円/kWh, 7/1〜9/30の平日 08:00〜13:00, 16:00〜22:00)
+  otherDayRate: number; // その他季昼間(円/kWh, 10/1〜翌6/30の平日・土曜 08:00〜22:00)
+  nightRate: number; // 夜間・休日(円/kWh, 全期間の夜間 22:00〜翌08:00、および日曜・祝日の終日)
+  renewableRate: number; // 再エネ賦課金(円/kWh)
+  baseDiscount: number; // 基本料金削減効果(円/月)
+}
+
+export interface InvestmentItem {
+  id: string;
+  date: string; // 発生年月 (例: "2026-04", "2026-10", "2031-05")
+  category: string; // 区分 (例: "初期設備投資", "設備増設", "パワコン更新", "定期保守費", "補助金(控除)")
+  title: string; // 項目名 (例: "初期設置工事一式", "パネル倍増工事", "PCS入替え")
+  amount: number; // 金額 (円) ※補助金の場合はマイナス入力可能
+  notes?: string; // 備考
+}
+
+const DEFAULT_ELECTRICITY_RATES: ElectricityRate[] = [
+  {
+    id: 'rate-2026-04-01',
+    startDate: '2026-04-01',
+    summerPeakRate: 21.45,
+    summerDayRate: 18.98,
+    otherDayRate: 18.03,
+    nightRate: 16.88,
+    renewableRate: 4.18,
+    baseDiscount: 15000,
+  },
+];
+
+const DEFAULT_INVESTMENTS: InvestmentItem[] = [
+  {
+    id: 'inv-1',
+    date: '2026-04',
+    category: '初期設備投資',
+    title: '初期設置工事一式',
+    amount: 10000000,
+    notes: '太陽光発電設備初期導入工事',
+  },
+  {
+    id: 'inv-2',
+    date: '2026-10',
+    category: '設備増設',
+    title: 'パネル増設工事',
+    amount: 5000000,
+    notes: '追加パネル増設工事',
+  },
+  {
+    id: 'inv-3',
+    date: '2026-04',
+    category: '補助金(控除)',
+    title: '導入促進補助金',
+    amount: -2000000,
+    notes: '導入促進補助金（控除）',
+  },
+];
+
+const INVESTMENT_CATEGORIES = [
+  '初期設備投資',
+  '設備増設',
+  'パワコン更新',
+  '定期保守費',
+  '補助金(控除)',
+  'その他',
+];
+
+/**
+ * 年月文字列（"2026-4", "2026年4月", "2026/04" 等）を標準の "YYYY-MM" 形式に正規化する関数
+ */
+const normalizeYearMonth = (rawYm: string): string => {
+  const match = rawYm.trim().match(/(\d{4})[年/\-]0?(\d{1,2})/);
+  if (!match) return rawYm.trim();
+  const y = match[1];
+  const m = String(parseInt(match[2], 10)).padStart(2, '0');
+  return `${y}-${m}`;
+};
+
+/**
+ * 日付文字列（"YYYY-MM-DD", "YYYY年MM月DD日", "YYYY/MM/DD", "YYYY-MM" 等）を標準の "YYYY-MM-DD" 形式に正規化する関数
+ */
+const normalizeDateString = (rawDate: string): string => {
+  const trimmed = rawDate.trim();
+  const ymdMatch = trimmed.match(/(\d{4})[年/\-]0?(\d{1,2})[月/\-]0?(\d{1,2})/);
+  if (ymdMatch) {
+    const y = ymdMatch[1];
+    const m = String(parseInt(ymdMatch[2], 10)).padStart(2, '0');
+    const d = String(parseInt(ymdMatch[3], 10)).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  const ymMatch = trimmed.match(/(\d{4})[年/\-]0?(\d{1,2})/);
+  if (ymMatch) {
+    const y = ymMatch[1];
+    const m = String(parseInt(ymMatch[2], 10)).padStart(2, '0');
+    return `${y}-${m}-01`;
+  }
+  return trimmed;
+};
+
+/**
+ * 測定日（dateStr: "YYYY-MM-DD"）以前で最も新しい startDate を持つ単価セットを取得する関数
+ */
+const getApplicableRateForDate = (
+  dateStr: string,
+  rates: ElectricityRate[]
+): ElectricityRate => {
+  const normDate = normalizeDateString(dateStr);
+  const fallback = DEFAULT_ELECTRICITY_RATES[0];
+  if (!rates || rates.length === 0) return fallback;
+
+  const sorted = [...rates].sort((a, b) =>
+    normalizeDateString(a.startDate).localeCompare(normalizeDateString(b.startDate))
+  );
+
+  const eligible = sorted.filter((r) => normalizeDateString(r.startDate) <= normDate);
+  if (eligible.length > 0) {
+    return eligible[eligible.length - 1];
+  }
+  return sorted[0];
+};
+
+/**
+ * 指定年月（year, month）時点で有効な単価（月の代表日時点の最新単価）を取得する関数
+ */
+const getApplicableRateForMonth = (
+  year: number | string,
+  month: number | string,
+  rates: ElectricityRate[]
+): ElectricityRate => {
+  const targetDate = `${year}-${String(month).padStart(2, '0')}-28`;
+  return getApplicableRateForDate(targetDate, rates);
+};
+
+/**
+ * 日本の国民の祝日・振替休日・国民の休日を正確に算出・判定する関数（国民の祝日法準拠）
+ */
+const getJapaneseHolidays = (year: number): Set<string> => {
+  const holidays = new Set<string>();
+  const addH = (m: number, d: number) => {
+    holidays.add(`${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`);
+  };
+
+  // 固定祝日
+  addH(1, 1); // 元日
+  addH(2, 11); // 建国記念の日
+  addH(2, 23); // 天皇誕生日
+  addH(4, 29); // 昭和の日
+  addH(5, 3); // 憲法記念日
+  addH(5, 4); // みどりの日
+  addH(5, 5); // こどもの日
+  addH(8, 11); // 山の日
+  addH(11, 3); // 文化の日
+  addH(11, 23); // 勤労感謝の日
+
+  // ハッピーマンデー（指定月の第n月曜日）
+  const getNthMonday = (m: number, n: number): number => {
+    let count = 0;
+    for (let d = 1; d <= 31; d++) {
+      const dt = new Date(year, m - 1, d);
+      if (dt.getMonth() !== m - 1) break;
+      if (dt.getDay() === 1) {
+        count++;
+        if (count === n) return d;
+      }
+    }
+    return 0;
+  };
+
+  const adultDay = getNthMonday(1, 2);
+  if (adultDay) addH(1, adultDay); // 成人の日
+
+  const seaDay = getNthMonday(7, 3);
+  if (seaDay) addH(7, seaDay); // 海の日
+
+  const agedDay = getNthMonday(9, 3);
+  if (agedDay) addH(9, agedDay); // 敬老の日
+
+  const sportsDay = getNthMonday(10, 2);
+  if (sportsDay) addH(10, sportsDay); // スポーツの日
+
+  // 春分の日・秋分の日（天文計算による略算式）
+  const springEquinox = Math.floor(
+    20.8431 + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4)
+  );
+  const autumnEquinox = Math.floor(
+    23.2488 + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4)
+  );
+  addH(3, springEquinox);
+  addH(9, autumnEquinox);
+
+  // 国民の休日（祝日と祝日に挟まれた平日）
+  for (let m = 1; m <= 12; m++) {
+    for (let d = 2; d <= 30; d++) {
+      const prevKey = `${year}-${String(m).padStart(2, '0')}-${String(d - 1).padStart(2, '0')}`;
+      const nextKey = `${year}-${String(m).padStart(2, '0')}-${String(d + 1).padStart(2, '0')}`;
+      const curKey = `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const dt = new Date(year, m - 1, d);
+      if (
+        holidays.has(prevKey) &&
+        holidays.has(nextKey) &&
+        !holidays.has(curKey) &&
+        dt.getDay() !== 0
+      ) {
+        holidays.add(curKey);
+      }
+    }
+  }
+
+  // 振替休日（祝日が日曜日の場合、その後の国民の祝日でない最初の日）
+  const baseHolidays = Array.from(holidays);
+  for (const hStr of baseHolidays) {
+    const parts = hStr.split('-').map(Number);
+    const m = parts[1];
+    const d = parts[2];
+    const dt = new Date(year, m - 1, d);
+    if (dt.getDay() === 0) {
+      let subD = d + 1;
+      let subDt = new Date(year, m - 1, subD);
+      let subKey = `${year}-${String(subDt.getMonth() + 1).padStart(2, '0')}-${String(
+        subDt.getDate()
+      ).padStart(2, '0')}`;
+      while (holidays.has(subKey)) {
+        subD++;
+        subDt = new Date(year, m - 1, subD);
+        subKey = `${year}-${String(subDt.getMonth() + 1).padStart(2, '0')}-${String(
+          subDt.getDate()
+        ).padStart(2, '0')}`;
+      }
+      holidays.add(subKey);
+    }
+  }
+
+  return holidays;
+};
+
+const holidayCache = new Map<number, Set<string>>();
+export const isJapaneseHoliday = (year: number, month: number, day: number): boolean => {
+  if (!holidayCache.has(year)) {
+    holidayCache.set(year, getJapaneseHolidays(year));
+  }
+  const key = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return holidayCache.get(year)!.has(key);
+};
+
+export type TimeRateType = 'summerPeak' | 'summerDay' | 'otherDay' | 'night';
+
+export interface RecordRateEvaluation {
+  rateType: TimeRateType;
+  rateName: string;
+  unitPrice: number;
+  applicableRate: ElectricityRate;
+}
+
+/**
+ * 15分値レコードの測定日時（タイムスタンプ）から、曜日・祝日・季節・時間帯を総合判定し、
+ * 契約上の適用単価（円/kWh）および区分を決定する関数
+ *
+ * 【時間帯判定ルール】
+ * 1. 日曜日、または国民の祝日の場合（終日夜間扱い）：
+ *    - 24時間すべての自家消費量に nightRate (16.88円) を適用
+ * 2. 平日・土曜日の場合：
+ *    - 夜間（22:00〜翌07:45）➔ nightRate (16.88円)
+ *    - 昼間（08:00〜21:45）のうち：
+ *      * 夏季（7/1〜9/30）の平日 13:00〜15:45 ➔ summerPeakRate (21.45円)
+ *      * 夏季（7/1〜9/30）の上記以外（平日8-13,16-22時および土曜） ➔ summerDayRate (18.98円)
+ *      * その他季（10/1〜翌6/30）➔ otherDayRate (18.03円)
+ */
+export const evaluateRecordRate = (
+  timestamp: string,
+  rates: ElectricityRate[]
+): RecordRateEvaluation => {
+  const match = timestamp.match(
+    /(\d{4})[年/\-]0?(\d{1,2})[月/\-]0?(\d{1,2})日?(?:[\sT]+(\d{1,2}):(\d{2}))?/
+  );
+  let year = 2026;
+  let month = 4;
+  let day = 1;
+  let hour = 12;
+  let minute = 0;
+
+  if (match) {
+    year = parseInt(match[1], 10);
+    month = parseInt(match[2], 10);
+    day = parseInt(match[3], 10);
+    hour = match[4] ? parseInt(match[4], 10) : 0;
+    minute = match[5] ? parseInt(match[5], 10) : 0;
+  }
+
+  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const applicableRate = getApplicableRateForDate(dateStr, rates);
+
+  const dt = new Date(year, month - 1, day);
+  const dayOfWeek = dt.getDay(); // 0: 日曜, 1: 月曜, ..., 6: 土曜
+  const isSunday = dayOfWeek === 0;
+  const isHoliday = isJapaneseHoliday(year, month, day);
+
+  // ルール1: 日曜日、または国民の祝日の場合（終日夜間扱い）
+  if (isSunday || isHoliday) {
+    return {
+      rateType: 'night',
+      rateName: isHoliday ? '祝日(終日夜間)' : '日曜(終日夜間)',
+      unitPrice: applicableRate.nightRate,
+      applicableRate,
+    };
+  }
+
+  // ルール2: 平日・土曜日の場合
+  const totalMinutes = hour * 60 + minute;
+  // 昼間判定: 08:00〜21:45 (480分 〜 1305分)
+  const isDaytime = totalMinutes >= 8 * 60 && totalMinutes <= 21 * 60 + 45;
+
+  if (!isDaytime) {
+    return {
+      rateType: 'night',
+      rateName: '夜間(22:00-08:00)',
+      unitPrice: applicableRate.nightRate,
+      applicableRate,
+    };
+  }
+
+  // 夏季判定: 7月1日〜9月30日
+  const isSummer = month >= 7 && month <= 9;
+  if (isSummer) {
+    const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+    const isPeakHours = totalMinutes >= 13 * 60 && totalMinutes < 16 * 60; // 13:00〜15:45 (16:00未満)
+
+    if (isWeekday && isPeakHours) {
+      return {
+        rateType: 'summerPeak',
+        rateName: '夏季ピーク(平日13-16)',
+        unitPrice: applicableRate.summerPeakRate,
+        applicableRate,
+      };
+    }
+
+    return {
+      rateType: 'summerDay',
+      rateName: '夏季昼間',
+      unitPrice: applicableRate.summerDayRate,
+      applicableRate,
+    };
+  }
+
+  // その他季（10月1日〜翌6月30日）
+  return {
+    rateType: 'otherDay',
+    rateName: 'その他季昼間',
+    unitPrice: applicableRate.otherDayRate,
+    applicableRate,
+  };
+};
+
 const SIMULATION_DATA: Record<number, number> = {
   1: 3582,
   2: 4423,
@@ -359,6 +713,291 @@ const readFileAsText = (file: File): Promise<{ fileName: string; text: string }>
 };
 
 export default function App() {
+  // 1. ログイン認証ステート（初期値: ID "admin", パスワード "admin123"）
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('solar_is_logged_in') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [loginId, setLoginId] = useState('admin');
+  const [loginPassword, setLoginPassword] = useState('admin123');
+  const [loginError, setLoginError] = useState('');
+
+  const handleLogin = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (loginId.trim() === 'admin' && loginPassword === 'admin123') {
+      setIsLoggedIn(true);
+      setLoginError('');
+      try {
+        localStorage.setItem('solar_is_logged_in', 'true');
+      } catch {
+        // ignore storage errors
+      }
+    } else {
+      setLoginError('IDまたはパスワードが正しくありません。（テスト用: admin / admin123）');
+    }
+  };
+
+  const handleLogout = () => {
+    setIsLoggedIn(false);
+    try {
+      localStorage.removeItem('solar_is_logged_in');
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  // 2. 期間指定の電力単価設定ステート＆モーダル管理
+  const [electricityRates, setElectricityRates] = useState<ElectricityRate[]>(() => {
+    try {
+      const saved = localStorage.getItem('solar_electricity_rates');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (
+          Array.isArray(parsed) &&
+          parsed.length > 0 &&
+          parsed[0].summerPeakRate !== undefined &&
+          /^\d{4}-\d{2}-\d{2}$/.test(parsed[0].startDate)
+        ) {
+          return parsed;
+        }
+      }
+    } catch {
+      // fallback
+    }
+    return DEFAULT_ELECTRICITY_RATES;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('solar_electricity_rates', JSON.stringify(electricityRates));
+    } catch {
+      // ignore storage errors
+    }
+  }, [electricityRates]);
+
+  const rateDialogRef = useRef<HTMLDialogElement>(null);
+  const [editingRateId, setEditingRateId] = useState<string | null>(null);
+  const [rateForm, setRateForm] = useState({
+    startDate: '2026-04-01',
+    summerPeakRate: '21.45',
+    summerDayRate: '18.98',
+    otherDayRate: '18.03',
+    nightRate: '16.88',
+    renewableRate: '4.18',
+    baseDiscount: '15000',
+  });
+
+  const resetRateForm = () => {
+    setEditingRateId(null);
+    setRateForm({
+      startDate: `${selectedYear}-${String(selectedMonth).padStart(2, '0')}-01`,
+      summerPeakRate: '21.45',
+      summerDayRate: '18.98',
+      otherDayRate: '18.03',
+      nightRate: '16.88',
+      renewableRate: '4.18',
+      baseDiscount: '15000',
+    });
+  };
+
+  const openRateModal = () => {
+    resetRateForm();
+    rateDialogRef.current?.showModal();
+  };
+
+  const closeRateModal = () => {
+    rateDialogRef.current?.close();
+    setEditingRateId(null);
+  };
+
+  const handleEditRate = (rate: ElectricityRate) => {
+    setEditingRateId(rate.id);
+    setRateForm({
+      startDate: normalizeDateString(rate.startDate),
+      summerPeakRate: String(rate.summerPeakRate),
+      summerDayRate: String(rate.summerDayRate),
+      otherDayRate: String(rate.otherDayRate),
+      nightRate: String(rate.nightRate),
+      renewableRate: String(rate.renewableRate),
+      baseDiscount: String(rate.baseDiscount),
+    });
+  };
+
+  const handleDeleteRate = (id: string) => {
+    if (electricityRates.length <= 1) {
+      alert('最低1件の単価設定が必要です。');
+      return;
+    }
+    setElectricityRates((prev) => prev.filter((r) => r.id !== id));
+    if (editingRateId === id) {
+      resetRateForm();
+    }
+  };
+
+  const handleSaveRate = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const normalizedStart = normalizeDateString(rateForm.startDate);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedStart)) {
+      alert('適用開始日を「YYYY-MM-DD」形式で入力してください。');
+      return;
+    }
+    const newRate: ElectricityRate = {
+      id: editingRateId || `rate-${Date.now()}`,
+      startDate: normalizedStart,
+      summerPeakRate: parseFloat(rateForm.summerPeakRate) || 0,
+      summerDayRate: parseFloat(rateForm.summerDayRate) || 0,
+      otherDayRate: parseFloat(rateForm.otherDayRate) || 0,
+      nightRate: parseFloat(rateForm.nightRate) || 0,
+      renewableRate: parseFloat(rateForm.renewableRate) || 0,
+      baseDiscount: parseFloat(rateForm.baseDiscount) || 0,
+    };
+
+    setElectricityRates((prev) => {
+      if (editingRateId) {
+        return prev.map((r) => (r.id === editingRateId ? newRate : r));
+      }
+      return [...prev, newRate];
+    });
+    resetRateForm();
+  };
+
+  // 3. 設備投資・経費履歴の管理ステート＆モーダル管理
+  const [investments, setInvestments] = useState<InvestmentItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('solar_investment_items');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {
+      // fallback
+    }
+    return DEFAULT_INVESTMENTS;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('solar_investment_items', JSON.stringify(investments));
+    } catch {
+      // ignore storage errors
+    }
+  }, [investments]);
+
+  const investmentDialogRef = useRef<HTMLDialogElement>(null);
+  const [editingInvestmentId, setEditingInvestmentId] = useState<string | null>(null);
+  const [investmentForm, setInvestmentForm] = useState({
+    date: '2026-04',
+    category: '設備増設',
+    title: '',
+    amount: '',
+    notes: '',
+  });
+
+  const resetInvestmentForm = () => {
+    setEditingInvestmentId(null);
+    setInvestmentForm({
+      date: `${selectedYear}-${String(selectedMonth).padStart(2, '0')}`,
+      category: '設備増設',
+      title: '',
+      amount: '',
+      notes: '',
+    });
+  };
+
+  const openInvestmentModal = () => {
+    resetInvestmentForm();
+    investmentDialogRef.current?.showModal();
+  };
+
+  const closeInvestmentModal = () => {
+    investmentDialogRef.current?.close();
+    setEditingInvestmentId(null);
+  };
+
+  const handleEditInvestment = (item: InvestmentItem) => {
+    setEditingInvestmentId(item.id);
+    setInvestmentForm({
+      date: normalizeYearMonth(item.date),
+      category: item.category,
+      title: item.title,
+      amount: String(item.amount),
+      notes: item.notes || '',
+    });
+  };
+
+  const handleDeleteInvestment = (id: string) => {
+    setInvestments((prev) => prev.filter((item) => item.id !== id));
+    if (editingInvestmentId === id) {
+      resetInvestmentForm();
+    }
+  };
+
+  const handleSaveInvestment = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const normalizedDate = normalizeYearMonth(investmentForm.date);
+    if (!/^\d{4}-\d{2}$/.test(normalizedDate)) {
+      alert('発生年月を「YYYY-MM」形式で入力してください。');
+      return;
+    }
+    if (!investmentForm.title.trim()) {
+      alert('項目名を入力してください。');
+      return;
+    }
+    const parsedAmount = parseFloat(investmentForm.amount);
+    if (isNaN(parsedAmount)) {
+      alert('有効な金額を入力してください。');
+      return;
+    }
+
+    const newItem: InvestmentItem = {
+      id: editingInvestmentId || `inv-${Date.now()}`,
+      date: normalizedDate,
+      category: investmentForm.category,
+      title: investmentForm.title.trim(),
+      amount: parsedAmount,
+      notes: investmentForm.notes.trim() || undefined,
+    };
+
+    setInvestments((prev) => {
+      if (editingInvestmentId) {
+        return prev.map((item) => (item.id === editingInvestmentId ? newItem : item));
+      }
+      return [...prev, newItem];
+    });
+    resetInvestmentForm();
+  };
+
+  // <dialog closedby="any"> 非対応ブラウザ向け Light-Dismiss フォールバック
+  useEffect(() => {
+    if (typeof HTMLDialogElement === 'undefined') return;
+    if ('closedBy' in HTMLDialogElement.prototype) return;
+
+    const dialogs = [rateDialogRef.current, investmentDialogRef.current].filter(
+      (d): d is HTMLDialogElement => d !== null
+    );
+
+    const handleBackdropClick = (event: MouseEvent) => {
+      const dialog = event.currentTarget as HTMLDialogElement;
+      if (event.target !== dialog) return;
+      const rect = dialog.getBoundingClientRect();
+      const isDialogContent =
+        rect.top <= event.clientY &&
+        event.clientY <= rect.top + rect.height &&
+        rect.left <= event.clientX &&
+        event.clientX <= rect.left + rect.width;
+      if (isDialogContent) return;
+      dialog.close();
+    };
+
+    dialogs.forEach((d) => d.addEventListener('click', handleBackdropClick));
+    return () => {
+      dialogs.forEach((d) => d.removeEventListener('click', handleBackdropClick));
+    };
+  }, [isLoggedIn]);
+
   const [activeTab, setActiveTab] = useState(1);
 
   const [selectedYear, setSelectedYear] = useState('2026');
@@ -493,13 +1132,26 @@ export default function App() {
           h.replace(/^\uFEFF/, '').trim()
         );
 
-        const timeIdx = headers.indexOf('測定時間');
-        const genKwIdx = headers.indexOf('発電 (kW)');
-        const toBuildingKwIdx = headers.indexOf('建物へ (kW)');
-        const toGridKwIdx = headers.indexOf('系統へ (kW)');
-        const consKwIdx = headers.indexOf('消費 (kW)');
-        const solarKwIdx = headers.indexOf('太陽光から (kW)');
-        const gridFromKwIdx = headers.indexOf('系統から (kW)');
+        const findHeaderIdx = (targetNames: string[]): number => {
+          for (const name of targetNames) {
+            const idx = headers.indexOf(name);
+            if (idx !== -1) return idx;
+          }
+          for (const name of targetNames) {
+            const cleanName = name.replace(/\s+/g, '');
+            const idx = headers.findIndex((h) => h.replace(/\s+/g, '') === cleanName);
+            if (idx !== -1) return idx;
+          }
+          return -1;
+        };
+
+        const timeIdx = findHeaderIdx(['測定時間', 'Time', 'Date/Time']);
+        const genKwIdx = findHeaderIdx(['発電 (kW)', '発電(kW)', '発電 (kWh)', '発電(kWh)']);
+        const toBuildingKwIdx = findHeaderIdx(['建物へ (kW)', '建物へ(kW)']);
+        const toGridKwIdx = findHeaderIdx(['系統へ (kW)', '系統へ(kW)']);
+        const consKwIdx = findHeaderIdx(['消費 (kW)', '消費(kW)', '消費 (kWh)', '消費(kWh)']);
+        const solarKwIdx = findHeaderIdx(['太陽光から (kW)', '太陽光から(kW)', '太陽光から (kWh)']);
+        const gridFromKwIdx = findHeaderIdx(['系統から (kW)', '系統から(kW)', '系統から (kWh)']);
 
         for (let i = headerLineIdx + 1; i < lines.length; i++) {
           const cols = parseCSVLine(lines[i]);
@@ -508,19 +1160,19 @@ export default function App() {
           const parsedTime = parseMeasurementTime(cols[timeIdx]);
           if (!parsedTime) continue;
 
-          // 取得値 (kW) を 4 で割って電力量 (kWh) に変換 (kW / 4)
+          // 取得値 (kW) を 4 で割って電力量 (kWh) に変換 (value * 0.25)
           const generation =
-            genKwIdx !== -1 ? parseNumberValue(cols[genKwIdx]) / 4 : 0;
+            genKwIdx !== -1 ? parseNumberValue(cols[genKwIdx]) * 0.25 : 0;
           const toBuilding =
-            toBuildingKwIdx !== -1 ? parseNumberValue(cols[toBuildingKwIdx]) / 4 : 0;
+            toBuildingKwIdx !== -1 ? parseNumberValue(cols[toBuildingKwIdx]) * 0.25 : 0;
           const toGrid =
-            toGridKwIdx !== -1 ? parseNumberValue(cols[toGridKwIdx]) / 4 : 0;
+            toGridKwIdx !== -1 ? parseNumberValue(cols[toGridKwIdx]) * 0.25 : 0;
           const consumption =
-            consKwIdx !== -1 ? parseNumberValue(cols[consKwIdx]) / 4 : 0;
+            consKwIdx !== -1 ? parseNumberValue(cols[consKwIdx]) * 0.25 : 0;
           const solarFrom =
-            solarKwIdx !== -1 ? parseNumberValue(cols[solarKwIdx]) / 4 : 0;
+            solarKwIdx !== -1 ? parseNumberValue(cols[solarKwIdx]) * 0.25 : 0;
           const gridFrom =
-            gridFromKwIdx !== -1 ? parseNumberValue(cols[gridFromKwIdx]) / 4 : 0;
+            gridFromKwIdx !== -1 ? parseNumberValue(cols[gridFromKwIdx]) * 0.25 : 0;
 
           rawIntervalRows.push({
             timestamp: parsedTime.timestamp,
@@ -727,6 +1379,16 @@ export default function App() {
       const cleanAllIntervals: SolarIntervalRecord[] = mergedUniqueIntervals.map(
         ({ year: _y, month: _m, day: _d, epochMs: _e, ...rec }) => rec
       );
+
+      // 指示3: 処理完了後、`console.log("仕分け完了データ:", ...)` を出力し、処理件数と抽出月がコンソールで確認できるようにすること
+      console.log("仕分け完了データ:", {
+        処理件数: cleanAllIntervals.length,
+        抽出月: importedMonths,
+        月別内訳: Object.fromEntries(
+          Array.from(ymGroupMap.entries()).map(([ym, info]) => [ym, `${info.count} 件`])
+        ),
+        データ: cleanAllIntervals,
+      });
 
       setAllDailyData((prev) => {
         const intervalMap = new Map<string, SolarIntervalRecord>();
@@ -1058,13 +1720,254 @@ export default function App() {
       ? ((actualForRatio / currentSimValue - 1) * 100).toFixed(1)
       : '0.0';
 
-  const roiData = [
-    { year: '0年', sim: -10000, actual: -10000 },
-    { year: '1年', sim: -8547, actual: -8200 },
-    { year: '2年', sim: -7099, actual: -6500 },
-    { year: '3年', sim: -5658, actual: -5000 },
-    { year: '4年', sim: -4223, actual: null },
-  ];
+  // 4. 15分値に基づく動的収益改善額・投資回収率の計算（休日・季節・時間帯別単価対応）
+  const calculateMonthSavings = (year: number | string, month: number | string) => {
+    const yNum = Number(year);
+    const mNum = Number(month);
+    const matchingRecords = allDailyData.filter((item) =>
+      isStrictMatchingYearMonth(item, year, month)
+    );
+    const intervals = matchingRecords.filter(isIntervalRecord);
+    const dailies = matchingRecords.filter(
+      (item): item is DailyDataItem => !isIntervalRecord(item)
+    );
+
+    const monthLatestRate = getApplicableRateForMonth(year, month, electricityRates);
+
+    if (intervals.length > 0) {
+      let summerPeakKwh = 0;
+      let summerDayKwh = 0;
+      let otherDayKwh = 0;
+      let nightKwh = 0;
+      let energySavingsYen = 0;
+      let renewableSavingsYen = 0;
+
+      for (const rec of intervals) {
+        const evalResult = evaluateRecordRate(rec.timestamp, electricityRates);
+        const kwh = rec.solarFrom;
+        if (evalResult.rateType === 'summerPeak') {
+          summerPeakKwh += kwh;
+        } else if (evalResult.rateType === 'summerDay') {
+          summerDayKwh += kwh;
+        } else if (evalResult.rateType === 'otherDay') {
+          otherDayKwh += kwh;
+        } else {
+          nightKwh += kwh;
+        }
+        energySavingsYen += kwh * evalResult.unitPrice;
+        renewableSavingsYen += kwh * evalResult.applicableRate.renewableRate;
+      }
+
+      const totalSolarKwh = summerPeakKwh + summerDayKwh + otherDayKwh + nightKwh;
+      const baseDiscountYen = monthLatestRate.baseDiscount;
+      const savingsYen = energySavingsYen + renewableSavingsYen + baseDiscountYen;
+
+      return {
+        hasData: true,
+        summerPeakKwh,
+        summerDayKwh,
+        otherDayKwh,
+        nightKwh,
+        totalSolarKwh,
+        energySavingsYen,
+        renewableSavingsYen,
+        baseDiscountYen,
+        savingsYen,
+        rate: monthLatestRate,
+      };
+    }
+
+    if (dailies.length > 0) {
+      let summerPeakKwh = 0;
+      let summerDayKwh = 0;
+      let otherDayKwh = 0;
+      let nightKwh = 0;
+      let energySavingsYen = 0;
+      let renewableSavingsYen = 0;
+
+      const isSummer = mNum >= 7 && mNum <= 9;
+
+      for (const d of dailies) {
+        const { day } = extractMonthAndDay(d.date);
+        const dayVal = day || 1;
+        const dt = new Date(yNum, mNum - 1, dayVal);
+        const dayOfWeek = dt.getDay();
+        const isSunday = dayOfWeek === 0;
+        const isHoliday = isJapaneseHoliday(yNum, mNum, dayVal);
+        const applicableRate = getApplicableRateForDate(
+          `${yNum}-${String(mNum).padStart(2, '0')}-${String(dayVal).padStart(2, '0')}`,
+          electricityRates
+        );
+
+        const kwh = d.solarFrom;
+        if (isSunday || isHoliday) {
+          nightKwh += kwh;
+          energySavingsYen += kwh * applicableRate.nightRate;
+        } else if (isSummer) {
+          // 平日昼間のうち13-16時（約35%）をピーク、残りを昼間
+          const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+          if (isWeekday) {
+            const peakPart = kwh * 0.35;
+            const dayPart = kwh * 0.65;
+            summerPeakKwh += peakPart;
+            summerDayKwh += dayPart;
+            energySavingsYen +=
+              peakPart * applicableRate.summerPeakRate + dayPart * applicableRate.summerDayRate;
+          } else {
+            summerDayKwh += kwh;
+            energySavingsYen += kwh * applicableRate.summerDayRate;
+          }
+        } else {
+          otherDayKwh += kwh;
+          energySavingsYen += kwh * applicableRate.otherDayRate;
+        }
+        renewableSavingsYen += kwh * applicableRate.renewableRate;
+      }
+
+      const totalSolarKwh = summerPeakKwh + summerDayKwh + otherDayKwh + nightKwh;
+      const baseDiscountYen = monthLatestRate.baseDiscount;
+      const savingsYen = energySavingsYen + renewableSavingsYen + baseDiscountYen;
+
+      return {
+        hasData: true,
+        summerPeakKwh,
+        summerDayKwh,
+        otherDayKwh,
+        nightKwh,
+        totalSolarKwh,
+        energySavingsYen,
+        renewableSavingsYen,
+        baseDiscountYen,
+        savingsYen,
+        rate: monthLatestRate,
+      };
+    }
+
+    return {
+      hasData: false,
+      summerPeakKwh: 0,
+      summerDayKwh: 0,
+      otherDayKwh: 0,
+      nightKwh: 0,
+      totalSolarKwh: 0,
+      energySavingsYen: 0,
+      renewableSavingsYen: 0,
+      baseDiscountYen: 0,
+      savingsYen: 0,
+      rate: monthLatestRate,
+    };
+  };
+
+  // 当月収益改善額の算出
+  const currentMonthSavingsInfo = calculateMonthSavings(selectedYear, selectedMonth);
+  const displayMonthlySavingsK = currentMonthSavingsInfo.hasData
+    ? Math.round(currentMonthSavingsInfo.savingsYen / 1000).toLocaleString()
+    : '0';
+
+  // 選択年月時点（selectedYM）までの累計収益改善額および累計投資・経費額の算出
+  const selectedYMNormalized = normalizeYearMonth(`${selectedYear}-${selectedMonth}`);
+
+  // allDailyData に存在するすべてのユニークな (year, month) を抽出し、selectedYM 以前の月を合算
+  const uniqueYearMonthsMap = new Map<string, { year: number; month: number }>();
+  for (const item of allDailyData) {
+    const ymMatch = item.yearMonth.match(/(\d{4})年0?(\d{1,2})月/);
+    if (ymMatch) {
+      const y = parseInt(ymMatch[1], 10);
+      const m = parseInt(ymMatch[2], 10);
+      const norm = normalizeYearMonth(`${y}-${m}`);
+      if (!uniqueYearMonthsMap.has(norm)) {
+        uniqueYearMonthsMap.set(norm, { year: y, month: m });
+      }
+    }
+  }
+
+  let cumulativeSavingsUpToSelectedYen = 0;
+  for (const [normYm, { year, month }] of uniqueYearMonthsMap.entries()) {
+    if (normYm <= selectedYMNormalized) {
+      const mInfo = calculateMonthSavings(year, month);
+      cumulativeSavingsUpToSelectedYen += mInfo.savingsYen;
+    }
+  }
+
+  // 選択年月時点までに発生した累計投資・経費額（補助金マイナス分も合算）
+  const investmentsUpToSelected = investments.filter(
+    (inv) => normalizeYearMonth(inv.date) <= selectedYMNormalized
+  );
+  const cumulativeInvestmentUpToSelectedYen = investmentsUpToSelected.reduce(
+    (sum, inv) => sum + inv.amount,
+    0
+  );
+  const totalAllInvestmentsYen = investments.reduce((sum, inv) => sum + inv.amount, 0);
+  const effectiveInvestmentYen =
+    investmentsUpToSelected.length > 0
+      ? cumulativeInvestmentUpToSelectedYen
+      : totalAllInvestmentsYen;
+
+  const displayDynamicRoiRate =
+    effectiveInvestmentYen > 0
+      ? ((cumulativeSavingsUpToSelectedYen / effectiveInvestmentYen) * 100).toFixed(1)
+      : '0.0';
+
+  // 投資回収タブ用データ（千円単位、設備投資・経費履歴と実績・シミュレーションに連動）
+  const baseStartYear = 2026;
+  const initialInvestmentsYen = investments
+    .filter((inv) => normalizeYearMonth(inv.date) <= `${baseStartYear}-04`)
+    .reduce((sum, inv) => sum + inv.amount, 0);
+  const startOutlayK = Math.round((initialInvestmentsYen || totalAllInvestmentsYen) / 1000);
+
+  const roiData = Array.from({ length: 5 }, (_, idx) => {
+    if (idx === 0) {
+      return {
+        year: '0年',
+        sim: -startOutlayK,
+        actual: -startOutlayK,
+      };
+    }
+    const targetYear = baseStartYear + idx - 1;
+    const endOfYearYM = `${targetYear}-12`;
+
+    // targetYear末までの累計投資額 (千円)
+    const cumInvYen = investments
+      .filter((inv) => normalizeYearMonth(inv.date) <= endOfYearYM)
+      .reduce((sum, inv) => sum + inv.amount, 0);
+    const cumInvK = Math.round((cumInvYen || totalAllInvestmentsYen) / 1000);
+
+    // シミュレーション上の年間改善額を積み上げ
+    let simCumSavingsYen = 0;
+    for (let y = baseStartYear; y <= targetYear; y++) {
+      for (let m = 1; m <= 12; m++) {
+        const ym = normalizeYearMonth(`${y}-${m}`);
+        if (ym < `${baseStartYear}-04`) continue;
+        const r = getApplicableRateForMonth(y, m, electricityRates);
+        const simSelfConsumeKwh = (SIMULATION_DATA[m] || 5000) * 0.85;
+        const isSummer = m >= 7 && m <= 9;
+        const avgRate = isSummer
+          ? r.summerPeakRate * 0.25 + r.summerDayRate * 0.75
+          : r.otherDayRate;
+        simCumSavingsYen +=
+          simSelfConsumeKwh * (avgRate + r.renewableRate) + r.baseDiscount;
+      }
+    }
+
+    // 実績データが存在する月までの累計改善額
+    let actualCumSavingsYen = 0;
+    let hasActualInOrBeforeYear = false;
+    for (const [normYm, { year, month }] of uniqueYearMonthsMap.entries()) {
+      if (year === targetYear) hasActualInOrBeforeYear = true;
+      if (normYm <= endOfYearYM) {
+        actualCumSavingsYen += calculateMonthSavings(year, month).savingsYen;
+      }
+    }
+
+    return {
+      year: `${idx}年(${targetYear})`,
+      sim: Math.round(simCumSavingsYen / 1000) - cumInvK,
+      actual:
+        hasActualInOrBeforeYear || targetYear <= Number(selectedYear)
+          ? Math.round(actualCumSavingsYen / 1000) - cumInvK
+          : null,
+    };
+  });
 
   const CustomScatterTooltip = ({
     active,
@@ -1093,6 +1996,96 @@ export default function App() {
     return null;
   };
 
+  // 未ログイン時はカード型ログイン画面を表示
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center p-6">
+        <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl border border-slate-100 p-8 md:p-10">
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-amber-500/10 text-amber-500 text-3xl mb-4">
+              ☀️
+            </div>
+            <h1 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+              西岡勝次商店 分析レポート
+            </h1>
+            <p className="text-xs font-medium text-slate-400 mt-2">
+              SolarEdge 太陽光発電・投資回収アナリティクス
+            </p>
+          </div>
+
+          <form onSubmit={handleLogin} className="space-y-5">
+            <div>
+              <label
+                htmlFor="login-username"
+                className="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-2"
+              >
+                ログインID
+              </label>
+              <input
+                id="login-username"
+                name="username"
+                type="text"
+                value={loginId}
+                onChange={(e) => setLoginId(e.target.value)}
+                autoComplete="username"
+                spellCheck={false}
+                autoCorrect="off"
+                autoCapitalize="none"
+                required
+                placeholder="admin"
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 font-medium text-sm focus:bg-white focus:border-slate-900 focus:outline-none transition-colors"
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="login-password"
+                className="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-2"
+              >
+                パスワード
+              </label>
+              <input
+                id="login-password"
+                name="current-password"
+                type="password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                autoComplete="current-password"
+                enterKeyHint="done"
+                required
+                placeholder="••••••••"
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 font-medium text-sm focus:bg-white focus:border-slate-900 focus:outline-none transition-colors"
+              />
+            </div>
+
+            {loginError && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-bold"
+              >
+                {loginError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-lg transition-all cursor-pointer"
+            >
+              ログイン
+            </button>
+
+            <div className="pt-3 border-t border-slate-100 text-center">
+              <p className="text-xs text-slate-400">
+                テスト用初期値: ID <code className="font-bold text-slate-600">admin</code> ／ パスワード{' '}
+                <code className="font-bold text-slate-600">admin123</code>
+              </p>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 p-6 md:p-10 pt-0 md:pt-0">
       {/* 複数週次CSVファイル一括選択用 input */}
@@ -1106,7 +2099,7 @@ export default function App() {
       />
 
       {/* 📌 上部固定（Sticky）ヘッダー＆タブ＆KPIカード領域 */}
-      <div className="sticky top-0 z-50 bg-slate-50/95 backdrop-blur-sm pt-6 md:pt-10 pb-6 border-b border-slate-200/60 -mx-6 md:-mx-10 px-6 md:px-10 mb-8 print:relative print:border-none print:p-0 print:m-0">
+      <div className="sticky top-0 z-40 bg-slate-50/95 backdrop-blur-sm pt-6 md:pt-10 pb-6 border-b border-slate-200/60 -mx-6 md:-mx-10 px-6 md:px-10 mb-8 print:relative print:border-none print:p-0 print:m-0">
         <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 print:mb-0">
           <div>
             <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
@@ -1163,14 +2156,35 @@ export default function App() {
               </button>
             </div>
           </div>
-          <div className="flex gap-3 print:hidden">
+          <div className="flex flex-wrap items-center gap-2.5 print:hidden">
+            <button
+              type="button"
+              onClick={openRateModal}
+              className="bg-white text-slate-700 border border-slate-200 px-4 py-2.5 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all shadow-sm cursor-pointer"
+            >
+              ⚡ 単価設定
+            </button>
+            <button
+              type="button"
+              onClick={openInvestmentModal}
+              className="bg-white text-slate-700 border border-slate-200 px-4 py-2.5 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all shadow-sm cursor-pointer"
+            >
+              💰 投資・経費管理
+            </button>
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={isLoading}
-              className="bg-slate-900 text-white px-6 py-2.5 rounded-xl text-sm font-bold hover:bg-slate-800 transition-all shadow-lg cursor-pointer disabled:opacity-50"
+              className="bg-slate-900 text-white px-5 py-2.5 rounded-xl text-sm font-bold hover:bg-slate-800 transition-all shadow-lg cursor-pointer disabled:opacity-50"
             >
               {isLoading ? '処理中...' : 'データインポート'}
+            </button>
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="bg-rose-50 text-rose-600 border border-rose-200 px-4 py-2.5 rounded-xl text-sm font-bold hover:bg-rose-100 transition-all cursor-pointer"
+            >
+              ログアウト
             </button>
           </div>
         </header>
@@ -1214,16 +2228,20 @@ export default function App() {
             },
             {
               label: '収益改善額',
-              val: '442',
+              val: displayMonthlySavingsK,
               unit: '千円',
-              sub: '当月推定値',
+              sub: currentMonthSavingsInfo.hasData
+                ? `単価 ${currentMonthSavingsInfo.rate.startDate}〜 (${Math.round(
+                    currentMonthSavingsInfo.savingsYen
+                  ).toLocaleString()}円)`
+                : `適用単価: ${currentMonthSavingsInfo.rate.startDate}〜`,
               color: 'text-slate-800',
             },
             {
               label: '投資回収率',
-              val: '50.0',
+              val: displayDynamicRoiRate,
               unit: '%',
-              sub: '初期投資比',
+              sub: `累計投資 ${(effectiveInvestmentYen / 10000).toLocaleString()}万円対比`,
               color: 'text-blue-600',
             },
           ].map((kpi) => (
@@ -1238,6 +2256,9 @@ export default function App() {
                 {kpi.val}{' '}
                 <span className="text-sm font-medium text-slate-400">{kpi.unit}</span>
               </p>
+              {kpi.sub && (
+                <p className="text-xs font-medium text-slate-400 mt-1.5">{kpi.sub}</p>
+              )}
             </div>
           ))}
         </div>
@@ -1273,15 +2294,17 @@ export default function App() {
                           margin={{ top: 20, right: 10, left: 0, bottom: 0 }}
                         >
                           <CartesianGrid
+                            yAxisId="left"
                             strokeDasharray="3 3"
                             vertical={false}
-                            stroke="#f1f5f9"
+                            stroke="#e2e8f0"
                           />
                           <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
                           <YAxis
                             yAxisId="left"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxCons]}
                             width={55}
                           />
@@ -1289,6 +2312,7 @@ export default function App() {
                             yAxisId="right"
                             orientation="right"
                             tick={false}
+                            tickLine={false}
                             axisLine={false}
                             width={55}
                           />
@@ -1310,15 +2334,6 @@ export default function App() {
                             fill="#f43f5e"
                             maxBarSize={40}
                           />
-                          <Line
-                            yAxisId="left"
-                            type="monotone"
-                            dataKey="consumption"
-                            name="総消費電力 (kWh)"
-                            stroke="#0f172a"
-                            strokeWidth={2}
-                            dot={false}
-                          />
                         </ComposedChart>
                       </ResponsiveContainer>
                     </div>
@@ -1336,15 +2351,17 @@ export default function App() {
                           margin={{ top: 20, right: 10, left: 0, bottom: 0 }}
                         >
                           <CartesianGrid
+                            yAxisId="left"
                             strokeDasharray="3 3"
                             vertical={false}
-                            stroke="#f1f5f9"
+                            stroke="#e2e8f0"
                           />
                           <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 12 }} />
                           <YAxis
                             yAxisId="left"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxGen]}
                             width={55}
                           />
@@ -1353,6 +2370,7 @@ export default function App() {
                             orientation="right"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxSun]}
                             width={55}
                           />
@@ -1403,15 +2421,17 @@ export default function App() {
                           margin={{ top: 20, right: 10, left: 0, bottom: 0 }}
                         >
                           <CartesianGrid
+                            yAxisId="left"
                             strokeDasharray="3 3"
                             vertical={false}
-                            stroke="#f1f5f9"
+                            stroke="#e2e8f0"
                           />
                           <XAxis dataKey="monthLabel" stroke="#94a3b8" tick={{ fontSize: 12 }} />
                           <YAxis
                             yAxisId="left"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxMonthCons]}
                             width={55}
                           />
@@ -1419,6 +2439,7 @@ export default function App() {
                             yAxisId="right"
                             orientation="right"
                             tick={false}
+                            tickLine={false}
                             axisLine={false}
                             width={55}
                           />
@@ -1471,15 +2492,17 @@ export default function App() {
                           margin={{ top: 20, right: 10, left: 0, bottom: 0 }}
                         >
                           <CartesianGrid
+                            yAxisId="left"
                             strokeDasharray="3 3"
                             vertical={false}
-                            stroke="#f1f5f9"
+                            stroke="#e2e8f0"
                           />
                           <XAxis dataKey="monthLabel" stroke="#94a3b8" tick={{ fontSize: 12 }} />
                           <YAxis
                             yAxisId="left"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxMonthGen]}
                             width={55}
                           />
@@ -1488,6 +2511,7 @@ export default function App() {
                             orientation="right"
                             stroke="#94a3b8"
                             tick={{ fontSize: 12 }}
+                            tickLine={true}
                             domain={[0, yMaxMonthSun]}
                             width={55}
                           />
@@ -1662,28 +2686,37 @@ export default function App() {
                     margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
                   >
                     <CartesianGrid
+                      yAxisId="left"
                       strokeDasharray="3 3"
                       vertical={false}
-                      stroke="#f1f5f9"
+                      stroke="#e2e8f0"
                     />
                     <XAxis
                       dataKey="name"
                       stroke="#94a3b8"
                       tick={{ fontSize: 14, fontWeight: 'bold' }}
                     />
-                    <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} domain={[0, yMaxSummary]} />
+                    <YAxis
+                      yAxisId="left"
+                      stroke="#94a3b8"
+                      tick={{ fontSize: 12 }}
+                      tickLine={true}
+                      domain={[0, yMaxSummary]}
+                    />
                     <Tooltip
                       cursor={{ fill: '#f8fafc' }}
                       contentStyle={{ borderRadius: '16px', border: 'none' }}
                     />
                     <Legend />
                     <Bar
+                      yAxisId="left"
                       dataKey="前年同月"
                       fill="#cbd5e1"
                       radius={[4, 4, 0, 0]}
                       maxBarSize={60}
                     />
                     <Bar
+                      yAxisId="left"
                       dataKey="選択月"
                       fill="#0f172a"
                       radius={[4, 4, 0, 0]}
@@ -1709,18 +2742,25 @@ export default function App() {
                     margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
                   >
                     <CartesianGrid
+                      yAxisId="left"
                       strokeDasharray="3 3"
                       vertical={false}
-                      stroke="#f1f5f9"
+                      stroke="#e2e8f0"
                     />
                     <XAxis dataKey="monthLabel" stroke="#94a3b8" tick={{ fontSize: 12 }} />
-                    <YAxis stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                    <YAxis
+                      yAxisId="left"
+                      stroke="#94a3b8"
+                      tick={{ fontSize: 12 }}
+                      tickLine={true}
+                    />
                     <Tooltip
                       cursor={{ fill: '#f8fafc' }}
                       contentStyle={{ borderRadius: '16px', border: 'none' }}
                     />
                     <Legend />
                     <Bar
+                      yAxisId="left"
                       dataKey="actual"
                       name="実績 (kWh)"
                       fill="#3b82f6"
@@ -1728,6 +2768,7 @@ export default function App() {
                       maxBarSize={40}
                     />
                     <Line
+                      yAxisId="left"
                       type="monotone"
                       dataKey="sim"
                       name="シミュレーション目標"
@@ -1753,15 +2794,22 @@ export default function App() {
                     margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
                   >
                     <CartesianGrid
+                      yAxisId="left"
                       strokeDasharray="3 3"
                       vertical={false}
-                      stroke="#f1f5f9"
+                      stroke="#e2e8f0"
                     />
                     <XAxis dataKey="year" stroke="#94a3b8" />
-                    <YAxis stroke="#94a3b8" />
+                    <YAxis
+                      yAxisId="left"
+                      stroke="#94a3b8"
+                      tick={{ fontSize: 12 }}
+                      tickLine={true}
+                    />
                     <Tooltip />
-                    <ReferenceLine y={0} stroke="#94a3b8" strokeWidth={2} />
+                    <ReferenceLine yAxisId="left" y={0} stroke="#94a3b8" strokeWidth={2} />
                     <Bar
+                      yAxisId="left"
                       dataKey="actual"
                       name="累計実績"
                       fill="#3b82f6"
@@ -1769,6 +2817,7 @@ export default function App() {
                       maxBarSize={40}
                     />
                     <Line
+                      yAxisId="left"
                       type="monotone"
                       dataKey="sim"
                       name="目標推移"
@@ -1782,6 +2831,599 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {/* ⚡ 期間指定の電力単価設定モーダル */}
+      <dialog
+        ref={rateDialogRef}
+        className="app-modal"
+        aria-labelledby="rate-modal-title"
+        {...({ closedby: 'any' } as React.DialogHTMLAttributes<HTMLDialogElement>)}
+      >
+        <div className="bg-white rounded-3xl shadow-2xl border border-slate-100 p-6 md:p-8 max-h-[88vh] overflow-y-auto text-slate-900">
+          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+            <div>
+              <h2 id="rate-modal-title" className="text-xl font-extrabold text-slate-900">
+                ⚡ 期間別 電力単価設定（高圧契約・休日判定対応）
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                各測定日以前で最も新しい「適用開始日（YYYY-MM-DD）」の単価セットを自動適用します（日曜日・国民の祝日は終日夜間扱い）。
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeRateModal}
+              className="w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold flex items-center justify-center cursor-pointer"
+              aria-label="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* 選択月の試算内訳プレビュー */}
+          <div className="mt-5 space-y-3">
+            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-100 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+              <div>
+                <p className="text-slate-400 font-bold">
+                  選択月 ({selectedYear}年{selectedMonth}月) 適用単価
+                </p>
+                <p className="text-sm font-black text-slate-800 mt-0.5">
+                  {currentMonthSavingsInfo.rate.startDate} 適用中
+                </p>
+              </div>
+              <div>
+                <p className="text-slate-400 font-bold">電力量料金削減 (各単価合計)</p>
+                <p className="text-sm font-black text-amber-600 mt-0.5">
+                  {Math.round(currentMonthSavingsInfo.energySavingsYen).toLocaleString()} 円
+                </p>
+              </div>
+              <div>
+                <p className="text-slate-400 font-bold">
+                  再エネ賦課金削減 ({currentMonthSavingsInfo.rate.renewableRate}円/kWh)
+                </p>
+                <p className="text-sm font-black text-indigo-600 mt-0.5">
+                  {Math.round(currentMonthSavingsInfo.renewableSavingsYen).toLocaleString()} 円
+                </p>
+              </div>
+              <div>
+                <p className="text-slate-400 font-bold">当月収益改善額 (基本料1.5万円含)</p>
+                <p className="text-sm font-black text-emerald-600 mt-0.5">
+                  {Math.round(currentMonthSavingsInfo.savingsYen).toLocaleString()} 円 ({displayMonthlySavingsK} 千円)
+                </p>
+              </div>
+            </div>
+
+            {/* 時間帯・区分別自家消費の内訳 */}
+            <div className="p-3.5 rounded-2xl bg-slate-50/70 border border-slate-100 grid grid-cols-2 md:grid-cols-4 gap-3 text-[11px]">
+              <div>
+                <span className="font-bold text-slate-400">夏季ピーク (平日13-16時):</span>{' '}
+                <span className="font-extrabold text-slate-700">
+                  {currentMonthSavingsInfo.summerPeakKwh.toFixed(1)} kWh
+                </span>
+              </div>
+              <div>
+                <span className="font-bold text-slate-400">夏季昼間 (平日8-13,16-22&土曜):</span>{' '}
+                <span className="font-extrabold text-slate-700">
+                  {currentMonthSavingsInfo.summerDayKwh.toFixed(1)} kWh
+                </span>
+              </div>
+              <div>
+                <span className="font-bold text-slate-400">その他季昼間 (平日・土曜8-22):</span>{' '}
+                <span className="font-extrabold text-slate-700">
+                  {currentMonthSavingsInfo.otherDayKwh.toFixed(1)} kWh
+                </span>
+              </div>
+              <div>
+                <span className="font-bold text-slate-400">夜間・休日 (22-翌8時 & 日祝終日):</span>{' '}
+                <span className="font-extrabold text-slate-700">
+                  {currentMonthSavingsInfo.nightKwh.toFixed(1)} kWh
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* 登録済み単価一覧テーブル */}
+          <div className="mt-6 overflow-x-auto">
+            <table className="w-full text-left border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 text-xs text-slate-400 uppercase">
+                  <th className="py-2.5 px-3">適用開始日</th>
+                  <th className="py-2.5 px-3">夏季ピーク (平日13-16)</th>
+                  <th className="py-2.5 px-3">夏季昼間 (平日8-13,16-22&土)</th>
+                  <th className="py-2.5 px-3">その他季昼間 (平日・土8-22)</th>
+                  <th className="py-2.5 px-3">夜間・休日 (22-8 & 日祝終日)</th>
+                  <th className="py-2.5 px-3">再エネ賦課金</th>
+                  <th className="py-2.5 px-3">基本料削減</th>
+                  <th className="py-2.5 px-3 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {[...electricityRates]
+                  .sort((a, b) =>
+                    normalizeDateString(a.startDate).localeCompare(normalizeDateString(b.startDate))
+                  )
+                  .map((r) => {
+                    const isApplied = r.id === currentMonthSavingsInfo.rate.id;
+                    return (
+                      <tr
+                        key={r.id}
+                        className={`${isApplied ? 'bg-amber-50/60' : 'hover:bg-slate-50'}`}
+                      >
+                        <td className="py-3 px-3 font-bold text-slate-900 whitespace-nowrap">
+                          {r.startDate}
+                          {isApplied && (
+                            <span className="ml-2 text-[10px] bg-amber-500 text-white px-2 py-0.5 rounded-full font-bold">
+                              選択月適用中
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 font-medium">{r.summerPeakRate} 円/kWh</td>
+                        <td className="py-3 px-3 font-medium">{r.summerDayRate} 円/kWh</td>
+                        <td className="py-3 px-3 font-medium">{r.otherDayRate} 円/kWh</td>
+                        <td className="py-3 px-3 font-medium">{r.nightRate} 円/kWh</td>
+                        <td className="py-3 px-3 font-medium">{r.renewableRate} 円/kWh</td>
+                        <td className="py-3 px-3 font-medium whitespace-nowrap">
+                          {r.baseDiscount.toLocaleString()} 円/月
+                        </td>
+                        <td className="py-3 px-3 text-right space-x-2 whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => handleEditRate(r)}
+                            className="text-xs font-bold text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 cursor-pointer"
+                          >
+                            編集
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteRate(r.id)}
+                            className="text-xs font-bold text-rose-600 hover:text-rose-800 px-2 py-1 rounded hover:bg-rose-50 cursor-pointer"
+                          >
+                            削除
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* 単価追加・編集フォーム */}
+          <form
+            onSubmit={handleSaveRate}
+            className="mt-6 p-5 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-700">
+                {editingRateId ? '✏️ 単価設定を編集' : '➕ 新しい期間単価を追加'}
+              </h3>
+              {editingRateId && (
+                <button
+                  type="button"
+                  onClick={resetRateForm}
+                  className="text-xs text-slate-500 hover:text-slate-800 font-bold cursor-pointer"
+                >
+                  新規追加モードへ戻す
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div>
+                <label
+                  htmlFor="rate-start-date"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  適用開始日 (YYYY-MM-DD)
+                </label>
+                <input
+                  id="rate-start-date"
+                  type="date"
+                  required
+                  value={rateForm.startDate}
+                  onChange={(e) => setRateForm({ ...rateForm, startDate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="rate-summer-peak"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  夏季ピーク (7/1-9/30平日 13-16時)
+                </label>
+                <input
+                  id="rate-summer-peak"
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="21.45"
+                  value={rateForm.summerPeakRate}
+                  onChange={(e) => setRateForm({ ...rateForm, summerPeakRate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="rate-summer-day"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  夏季昼間 (7/1-9/30平日 8-13,16-22&土)
+                </label>
+                <input
+                  id="rate-summer-day"
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="18.98"
+                  value={rateForm.summerDayRate}
+                  onChange={(e) => setRateForm({ ...rateForm, summerDayRate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="rate-other-day"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  その他季昼間 (10/1-翌6/30平日・土 8-22)
+                </label>
+                <input
+                  id="rate-other-day"
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="18.03"
+                  value={rateForm.otherDayRate}
+                  onChange={(e) => setRateForm({ ...rateForm, otherDayRate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label
+                  htmlFor="rate-night"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  夜間・休日 (22-翌8時 & 日祝終日)
+                </label>
+                <input
+                  id="rate-night"
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="16.88"
+                  value={rateForm.nightRate}
+                  onChange={(e) => setRateForm({ ...rateForm, nightRate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="rate-renewable"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  再エネ賦課金 (円/kWh)
+                </label>
+                <input
+                  id="rate-renewable"
+                  type="number"
+                  step="0.01"
+                  required
+                  placeholder="4.18"
+                  value={rateForm.renewableRate}
+                  onChange={(e) => setRateForm({ ...rateForm, renewableRate: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="rate-base-discount"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  基本料削減効果 (円/月)
+                </label>
+                <input
+                  id="rate-base-discount"
+                  type="number"
+                  step="100"
+                  required
+                  placeholder="15000"
+                  value={rateForm.baseDiscount}
+                  onChange={(e) => setRateForm({ ...rateForm, baseDiscount: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={closeRateModal}
+                className="px-4 py-2 rounded-xl border border-slate-200 bg-white text-slate-600 text-xs font-bold hover:bg-slate-100 cursor-pointer"
+              >
+                閉じる
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shadow cursor-pointer"
+              >
+                {editingRateId ? '更新して保存' : '単価設定を追加'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </dialog>
+
+      {/* 💰 設備投資・経費履歴管理モーダル */}
+      <dialog
+        ref={investmentDialogRef}
+        className="app-modal"
+        aria-labelledby="investment-modal-title"
+        {...({ closedby: 'any' } as React.DialogHTMLAttributes<HTMLDialogElement>)}
+      >
+        <div className="bg-white rounded-3xl shadow-2xl border border-slate-100 p-6 md:p-8 max-h-[88vh] overflow-y-auto text-slate-900">
+          <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+            <div>
+              <h2 id="investment-modal-title" className="text-xl font-extrabold text-slate-900">
+                💰 設備投資・経費履歴の管理
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                初期設置工事・パネル増設・パワコン更新・定期保守費・補助金（控除）を時系列で管理し、投資回収率へ動的に反映します
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={closeInvestmentModal}
+              className="w-9 h-9 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold flex items-center justify-center cursor-pointer"
+              aria-label="閉じる"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* 累計投資＆回収サマリー */}
+          <div className="mt-5 p-4 rounded-2xl bg-slate-50 border border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+            <div>
+              <p className="text-slate-400 font-bold">
+                選択月 ({selectedYear}年{selectedMonth}月) 時点の累計投資・経費純額
+              </p>
+              <p className="text-base font-black text-slate-900 mt-0.5">
+                {effectiveInvestmentYen.toLocaleString()} 円
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-400 font-bold">
+                選択月 ({selectedYear}年{selectedMonth}月) 時点の累計収益改善額
+              </p>
+              <p className="text-base font-black text-emerald-600 mt-0.5">
+                {Math.round(cumulativeSavingsUpToSelectedYen).toLocaleString()} 円
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-400 font-bold">動的投資回収率 ／ 全期間投資総額</p>
+              <p className="text-base font-black text-blue-600 mt-0.5">
+                {displayDynamicRoiRate}%{' '}
+                <span className="text-xs font-medium text-slate-400">
+                  (全期間純投資: {totalAllInvestmentsYen.toLocaleString()}円)
+                </span>
+              </p>
+            </div>
+          </div>
+
+          {/* 投資・経費一覧テーブル */}
+          <div className="mt-6 overflow-x-auto">
+            <table className="w-full text-left border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 text-xs text-slate-400 uppercase">
+                  <th className="py-2.5 px-3">発生年月</th>
+                  <th className="py-2.5 px-3">区分</th>
+                  <th className="py-2.5 px-3">項目名 / 備考</th>
+                  <th className="py-2.5 px-3 text-right">金額 (円)</th>
+                  <th className="py-2.5 px-3 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {[...investments]
+                  .sort((a, b) =>
+                    normalizeYearMonth(a.date).localeCompare(normalizeYearMonth(b.date))
+                  )
+                  .map((inv) => {
+                    const isIncludedInSelected =
+                      normalizeYearMonth(inv.date) <= selectedYMNormalized;
+                    return (
+                      <tr key={inv.id} className="hover:bg-slate-50">
+                        <td className="py-3 px-3 font-bold text-slate-900">
+                          {normalizeYearMonth(inv.date)}
+                          {!isIncludedInSelected && (
+                            <span className="ml-2 text-[10px] bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full font-bold">
+                              選択月より未来
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3">
+                          <span
+                            className={`inline-block text-xs font-bold px-2.5 py-1 rounded-full ${
+                              inv.amount < 0
+                                ? 'bg-emerald-50 text-emerald-700'
+                                : inv.category.includes('保守')
+                                ? 'bg-amber-50 text-amber-700'
+                                : 'bg-blue-50 text-blue-700'
+                            }`}
+                          >
+                            {inv.category}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3">
+                          <div className="font-bold text-slate-800">{inv.title}</div>
+                          {inv.notes && <div className="text-xs text-slate-400">{inv.notes}</div>}
+                        </td>
+                        <td
+                          className={`py-3 px-3 text-right font-extrabold ${
+                            inv.amount < 0 ? 'text-emerald-600' : 'text-slate-900'
+                          }`}
+                        >
+                          {inv.amount.toLocaleString()} 円
+                        </td>
+                        <td className="py-3 px-3 text-right space-x-2">
+                          <button
+                            type="button"
+                            onClick={() => handleEditInvestment(inv)}
+                            className="text-xs font-bold text-blue-600 hover:text-blue-800 px-2 py-1 rounded hover:bg-blue-50 cursor-pointer"
+                          >
+                            編集
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteInvestment(inv.id)}
+                            className="text-xs font-bold text-rose-600 hover:text-rose-800 px-2 py-1 rounded hover:bg-rose-50 cursor-pointer"
+                          >
+                            削除
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* 投資・経費追加／編集フォーム */}
+          <form
+            onSubmit={handleSaveInvestment}
+            className="mt-6 p-5 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-4"
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-700">
+                {editingInvestmentId
+                  ? '✏️ 投資・経費項目を編集'
+                  : '➕ 新しい設備投資・経費・補助金を追加'}
+              </h3>
+              {editingInvestmentId && (
+                <button
+                  type="button"
+                  onClick={resetInvestmentForm}
+                  className="text-xs text-slate-500 hover:text-slate-800 font-bold cursor-pointer"
+                >
+                  新規追加モードへ戻す
+                </button>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div>
+                <label
+                  htmlFor="inv-date"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  発生年月
+                </label>
+                <input
+                  id="inv-date"
+                  type="month"
+                  required
+                  value={investmentForm.date}
+                  onChange={(e) => setInvestmentForm({ ...investmentForm, date: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="inv-category"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  区分
+                </label>
+                <select
+                  id="inv-category"
+                  value={investmentForm.category}
+                  onChange={(e) =>
+                    setInvestmentForm({ ...investmentForm, category: e.target.value })
+                  }
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                >
+                  {INVESTMENT_CATEGORIES.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label
+                  htmlFor="inv-title"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  項目名
+                </label>
+                <input
+                  id="inv-title"
+                  type="text"
+                  required
+                  placeholder="例: パネル増設工事 / PCS更新"
+                  value={investmentForm.title}
+                  onChange={(e) => setInvestmentForm({ ...investmentForm, title: e.target.value })}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="inv-amount"
+                  className="block text-xs font-bold text-slate-500 mb-1"
+                >
+                  金額 (円 ※補助金はマイナス)
+                </label>
+                <input
+                  id="inv-amount"
+                  type="number"
+                  step="1000"
+                  required
+                  placeholder="例: 5000000 または -2000000"
+                  value={investmentForm.amount}
+                  onChange={(e) =>
+                    setInvestmentForm({ ...investmentForm, amount: e.target.value })
+                  }
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm font-bold"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label
+                htmlFor="inv-notes"
+                className="block text-xs font-bold text-slate-500 mb-1"
+              >
+                備考 (任意)
+              </label>
+              <input
+                id="inv-notes"
+                type="text"
+                placeholder="工事内容・保守契約の詳細など"
+                value={investmentForm.notes}
+                onChange={(e) => setInvestmentForm({ ...investmentForm, notes: e.target.value })}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={closeInvestmentModal}
+                className="px-4 py-2 rounded-xl border border-slate-200 bg-white text-slate-600 text-xs font-bold hover:bg-slate-100 cursor-pointer"
+              >
+                閉じる
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 shadow cursor-pointer"
+              >
+                {editingInvestmentId ? '更新して保存' : '履歴に追加'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </dialog>
     </div>
   );
 }

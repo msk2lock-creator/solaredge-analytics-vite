@@ -1,1 +1,16 @@
 /* App-specific custom styles */
+dialog.app-modal {
+  margin: auto;
+  border: none;
+  padding: 0;
+  background: transparent;
+  max-width: min(92vw, 56rem);
+  width: 100%;
+  max-height: 90vh;
+  overflow: visible;
+}
+
+dialog.app-modal::backdrop {
+  background-color: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(4px);
+}
