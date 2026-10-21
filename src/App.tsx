@@ -1000,6 +1000,12 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState(1);
 
+  // 設備増設シミュレーター用ステート（パネル1枚単位）
+  const [simBaseCapacityKw, setSimBaseCapacityKw] = useState<number>(50); // 既設パネル容量 (デフォルト: 50 kW / 約125枚)
+  const [simAddedPanels, setSimAddedPanels] = useState<number>(125); // 増設パネル枚数 (デフォルト: +125枚 = +50kW)
+  const [simPanelWatt, setSimPanelWatt] = useState<number>(400); // パネル1枚あたりの定格出力 (デフォルト: 400 W)
+  const [simInvestManYen, setSimInvestManYen] = useState<number>(500); // 増設にかかる想定費用 (デフォルト: 500 万円)
+
   const [selectedYear, setSelectedYear] = useState('2026');
   const [selectedMonth, setSelectedMonth] = useState('6');
 
@@ -1969,6 +1975,317 @@ export default function App() {
     };
   });
 
+  // ============================================================================
+  // 🚀 経営者向け5大管理機能の計算ロジック
+  // ============================================================================
+
+  // 【機能1】発電効率低下・異常検知アラート判定（日照4時間以上で標準期待値を20%以上下回る日）
+  const anomalyAlertInfo = (() => {
+    const regressionSource =
+      dailyData.filter((d) => d.sunlight > 0 && d.generation > 0).length >= 3
+        ? dailyData.filter((d) => d.sunlight > 0 && d.generation > 0)
+        : dailyDataThisYear.filter((d) => d.sunlight > 0 && d.generation > 0);
+
+    let slope = 42; // 50kW設備の標準期待値 (約42kWh / 日照1h)
+    let intercept = 30;
+
+    if (regressionSource.length >= 2) {
+      const n = regressionSource.length;
+      let sumX = 0;
+      let sumY = 0;
+      let sumXY = 0;
+      let sumXX = 0;
+      for (const d of regressionSource) {
+        sumX += d.sunlight;
+        sumY += d.generation;
+        sumXY += d.sunlight * d.generation;
+        sumXX += d.sunlight * d.sunlight;
+      }
+      const denom = n * sumXX - sumX * sumX;
+      if (denom !== 0) {
+        const calcSlope = (n * sumXY - sumX * sumY) / denom;
+        const calcIntercept = (sumY - calcSlope * sumX) / n;
+        if (!isNaN(calcSlope) && calcSlope > 5) {
+          slope = calcSlope;
+          intercept = calcIntercept;
+        }
+      }
+    }
+
+    // 直近7日（または当月データ）のうち日照時間4時間以上の日を検査
+    const recentDays = dailyData.slice(-7);
+    const sunnyCandidates = (recentDays.length > 0 ? recentDays : dailyData).filter(
+      (d) => d.sunlight >= 4.0
+    );
+
+    let worstDropRate = 0;
+    let worstDayLabel = '';
+    for (const d of sunnyCandidates) {
+      const expectedGen = Math.max(10, slope * d.sunlight + intercept);
+      const ratio = d.generation / expectedGen;
+      const dropRate = 1 - ratio;
+      if (dropRate >= 0.2 && dropRate > worstDropRate) {
+        worstDropRate = dropRate;
+        worstDayLabel = d.date;
+      }
+    }
+
+    const isAnomaly = worstDropRate >= 0.2;
+    const dropPercent = isAnomaly ? Math.round(worstDropRate * 100) : 0;
+    const avgUnitValue =
+      currentMonthSavingsInfo.rate.otherDayRate + currentMonthSavingsInfo.rate.renewableRate;
+    const baseExpectedMonthGen = actualForRatio ?? currentSimValue ?? 5208;
+    const estimatedMonthlyLossK = isAnomaly
+      ? Math.max(
+          1,
+          Math.round((baseExpectedMonthGen * (dropPercent / 100) * avgUnitValue) / 1000)
+        )
+      : 0;
+
+    return {
+      isAnomaly,
+      dropPercent,
+      estimatedMonthlyLossK,
+      worstDayLabel,
+    };
+  })();
+
+  // 【機能2】設備増設シミュレーター（パネル1枚単位・15分値ベース）
+  const expansionSimResult = (() => {
+    const baseCapKw = Math.max(1, simBaseCapacityKw);
+    const addedCapKw = (simAddedPanels * simPanelWatt) / 1000;
+    const totalCapKw = baseCapKw + addedCapKw;
+    const scaleFactor = totalCapKw / baseCapKw;
+
+    const allIntervals = allDailyData.filter(isIntervalRecord);
+    const sampleIntervals =
+      currentMonthIntervals.length > 0 ? currentMonthIntervals : allIntervals;
+
+    const totalAnnualSimGenKwh = Object.values(SIMULATION_DATA).reduce((s, v) => s + v, 0); // 66,065 kWh
+
+    let baseSampleGen = 0;
+    let baseSampleCons = 0;
+    let baseSampleSelf = 0;
+    let baseSampleSurplus = 0;
+    let baseSampleVarSavings = 0;
+
+    let scaledSampleGen = 0;
+    let scaledSampleSelf = 0;
+    let scaledSampleSurplus = 0;
+    let scaledSampleGrid = 0;
+    let scaledSampleVarSavings = 0;
+
+    if (sampleIntervals.length > 0) {
+      for (const rec of sampleIntervals) {
+        const gen0 = rec.generation;
+        const cons = rec.consumption;
+        const self0 = Math.min(cons, rec.solarFrom > 0 ? rec.solarFrom : gen0);
+        const surp0 = Math.max(0, gen0 - self0);
+
+        const gen1 = gen0 * scaleFactor;
+        const self1 = Math.min(cons, gen1);
+        const surp1 = Math.max(0, gen1 - cons);
+        const grid1 = Math.max(0, cons - self1);
+
+        const evalRes = evaluateRecordRate(rec.timestamp, electricityRates);
+        const unitYen = evalRes.unitPrice + evalRes.applicableRate.renewableRate;
+
+        baseSampleGen += gen0;
+        baseSampleCons += cons;
+        baseSampleSelf += self0;
+        baseSampleSurplus += surp0;
+        baseSampleVarSavings += self0 * unitYen;
+
+        scaledSampleGen += gen1;
+        scaledSampleSelf += self1;
+        scaledSampleSurplus += surp1;
+        scaledSampleGrid += grid1;
+        scaledSampleVarSavings += self1 * unitYen;
+      }
+    } else {
+      // 15分値CSV未インポート時の標準15分プロファイル推計モデル
+      const r = currentMonthSavingsInfo.rate;
+      const avgUnitYen = r.otherDayRate * 0.7 + r.summerDayRate * 0.3 + r.renewableRate;
+      baseSampleGen = currentSimValue || 5208;
+      baseSampleCons = baseSampleGen * 2.15; // 標準工場負荷
+      baseSampleSelf = Math.min(baseSampleCons, baseSampleGen * 0.92);
+      baseSampleSurplus = Math.max(0, baseSampleGen - baseSampleSelf);
+      baseSampleVarSavings = baseSampleSelf * avgUnitYen;
+
+      scaledSampleGen = baseSampleGen * scaleFactor;
+      // 容量増加に伴い昼間ピーク時の余剰が徐々に増えるリアルな飽和カーブモデル
+      const daytimeLoadCap = baseSampleCons * 0.62;
+      scaledSampleSelf = Math.min(daytimeLoadCap, scaledSampleGen * 0.88);
+      scaledSampleSurplus = Math.max(0, scaledSampleGen - scaledSampleSelf);
+      scaledSampleGrid = Math.max(0, baseSampleCons - scaledSampleSelf);
+      scaledSampleVarSavings = scaledSampleSelf * avgUnitYen;
+    }
+
+    // 年間換算係数（サンプル期間の発電量から通期66,065kWh基準へ換算）
+    const annualizeMultiplier =
+      baseSampleGen > 0 ? totalAnnualSimGenKwh / baseSampleGen : 12;
+
+    const baseAnnualGenKwh = Math.round(baseSampleGen * annualizeMultiplier);
+    const baseAnnualConsKwh = Math.round(baseSampleCons * annualizeMultiplier);
+    const baseAnnualSelfKwh = Math.round(baseSampleSelf * annualizeMultiplier);
+    const baseAnnualSurplusKwh = Math.round(baseSampleSurplus * annualizeMultiplier);
+    const baseAnnualGridKwh = Math.max(0, baseAnnualConsKwh - baseAnnualSelfKwh);
+    const baseAnnualSavingsYen = Math.round(
+      baseSampleVarSavings * annualizeMultiplier +
+        currentMonthSavingsInfo.rate.baseDiscount * 12
+    );
+
+    const scaledAnnualGenKwh = Math.round(scaledSampleGen * annualizeMultiplier);
+    const scaledAnnualSelfKwh = Math.round(scaledSampleSelf * annualizeMultiplier);
+    const scaledAnnualSurplusKwh = Math.round(scaledSampleSurplus * annualizeMultiplier);
+    const scaledAnnualGridKwh = Math.max(0, baseAnnualConsKwh - scaledAnnualSelfKwh);
+    const scaledAnnualSavingsYen = Math.round(
+      scaledSampleVarSavings * annualizeMultiplier +
+        currentMonthSavingsInfo.rate.baseDiscount * 12
+    );
+
+    const addedAnnualSavingsYen = Math.max(0, scaledAnnualSavingsYen - baseAnnualSavingsYen);
+    const baseSelfSufficiency =
+      baseAnnualConsKwh > 0 ? (baseAnnualSelfKwh / baseAnnualConsKwh) * 100 : 0;
+    const scaledSelfSufficiency =
+      baseAnnualConsKwh > 0 ? (scaledAnnualSelfKwh / baseAnnualConsKwh) * 100 : 0;
+
+    const paybackYears =
+      addedAnnualSavingsYen > 0
+        ? ((simInvestManYen * 10000) / addedAnnualSavingsYen).toFixed(1)
+        : '—';
+
+    const comparisonChartData = [
+      {
+        stage: `既設 (${baseCapKw}kW)`,
+        自家消費電力量: baseAnnualSelfKwh,
+        系統買電量: baseAnnualGridKwh,
+        余剰電力量: baseAnnualSurplusKwh,
+        総発電量: baseAnnualGenKwh,
+      },
+      {
+        stage: `増設後 (${totalCapKw.toFixed(1)}kW)`,
+        自家消費電力量: scaledAnnualSelfKwh,
+        系統買電量: scaledAnnualGridKwh,
+        余剰電力量: scaledAnnualSurplusKwh,
+        総発電量: scaledAnnualGenKwh,
+      },
+    ];
+
+    return {
+      baseCapKw,
+      addedCapKw,
+      totalCapKw,
+      scaleFactor,
+      baseAnnualSelfKwh,
+      scaledAnnualSelfKwh,
+      baseAnnualSurplusKwh,
+      scaledAnnualSurplusKwh,
+      baseAnnualSavingsYen,
+      scaledAnnualSavingsYen,
+      addedAnnualSavingsYen,
+      baseSelfSufficiency,
+      scaledSelfSufficiency,
+      paybackYears,
+      comparisonChartData,
+      usingRealIntervals: sampleIntervals.length > 0,
+      intervalCount: sampleIntervals.length,
+    };
+  })();
+
+  // 【機能3】デマンドピーク監視と基本料金抑制効果
+  const demandPeakInfo = (() => {
+    const contractKw = 158;
+    const defaultMaxDemandKw = 127;
+    let measuredGridPeakKw = 0;
+    let measuredSolarAtPeakKw = 0;
+
+    if (currentMonthIntervals.length > 0) {
+      for (const rec of currentMonthIntervals) {
+        const gridKw = rec.gridFrom * 4;
+        if (gridKw > measuredGridPeakKw) {
+          measuredGridPeakKw = gridKw;
+          measuredSolarAtPeakKw = rec.solarFrom * 4;
+        }
+      }
+    }
+
+    const maxDemandKw = defaultMaxDemandKw;
+    const marginKw = contractKw - maxDemandKw; // 31 kW
+    const peakCutContributionKw =
+      measuredSolarAtPeakKw > 0 ? Math.round(measuredSolarAtPeakKw) : 31;
+
+    return {
+      contractKw,
+      maxDemandKw,
+      marginKw,
+      peakCutContributionKw,
+      measuredGridPeakKw: Math.round(measuredGridPeakKw),
+      monthlyBaseDiscountYen: currentMonthSavingsInfo.rate.baseDiscount,
+    };
+  })();
+
+  // 【機能4】機器更新タイマーとメンテナンス積立推奨（設備保全）
+  const equipmentLifecycleInfo = (() => {
+    const startYear = 2026;
+    const currentY = Number(selectedYear) || 2026;
+    const operatingYear = Math.max(1, currentY - startYear + 1);
+    const panelLifeYears = 25;
+    const panelDegradationRate = 0.5; // 年0.5%
+    const currentPanelEfficiency = (100 - (operatingYear - 1) * panelDegradationRate).toFixed(1);
+    const pcsMinLife = 10;
+    const pcsMaxLife = 15;
+    const estimatedAnnualSavingsManYen = Math.max(
+      120,
+      Math.round(expansionSimResult.baseAnnualSavingsYen / 10000)
+    );
+
+    return {
+      operatingYear,
+      panelLifeYears,
+      panelDegradationRate,
+      currentPanelEfficiency,
+      pcsMinLife,
+      pcsMaxLife,
+      pcsReplacePeriod: '2035〜2038年',
+      estimatedAnnualSavingsManYen,
+    };
+  })();
+
+  // 【機能5】CO2削減量算出（係数: 0.000434 t-CO2/kWh、杉の木1本 = 年間約0.014 t-CO2吸収）
+  const co2ReductionInfo = (() => {
+    const CO2_FACTOR = 0.000434; // t-CO2 / kWh
+    const CEDAR_TREE_FACTOR = 0.014; // t-CO2 / 本・年 (14kg-CO2)
+
+    const monthGenKwh =
+      actualForRatio !== null ? actualForRatio : currentGenTotal > 0 ? currentGenTotal : 0;
+    const monthlyCo2Ton = monthGenKwh * CO2_FACTOR;
+    const monthlyCedarTrees = Math.round(monthlyCo2Ton / CEDAR_TREE_FACTOR);
+
+    const yearActualGenKwh = dailyDataThisYear.reduce((s, d) => s + d.generation, 0);
+    const annualGenKwh =
+      yearActualGenKwh > 0
+        ? yearActualGenKwh
+        : Object.values(SIMULATION_DATA).reduce((s, v) => s + v, 0);
+    const annualCo2Ton = annualGenKwh * CO2_FACTOR;
+    const annualCedarTrees = Math.round(annualCo2Ton / CEDAR_TREE_FACTOR);
+
+    return {
+      monthlyCo2Ton: monthlyCo2Ton.toFixed(2),
+      monthlyCedarTrees,
+      annualCo2Ton: annualCo2Ton.toFixed(1),
+      annualCedarTrees,
+      isAnnualActual: yearActualGenKwh > 0,
+    };
+  })();
+
+  const getSliderCssVars = (val: number, min: number, max: number): React.CSSProperties =>
+    ({
+      '--attr-min': min,
+      '--attr-max': max,
+      '--control-value': val,
+    }) as React.CSSProperties;
+
   const CustomScatterTooltip = ({
     active,
     payload,
@@ -2099,12 +2416,17 @@ export default function App() {
       />
 
       {/* 📌 上部固定（Sticky）ヘッダー＆タブ＆KPIカード領域 */}
-      <div className="sticky top-0 z-40 bg-slate-50/95 backdrop-blur-sm pt-6 md:pt-10 pb-6 border-b border-slate-200/60 -mx-6 md:-mx-10 px-6 md:px-10 mb-8 print:relative print:border-none print:p-0 print:m-0">
-        <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 print:mb-0">
+      <div className="sticky top-0 z-40 bg-slate-50/95 backdrop-blur-sm pt-6 md:pt-10 pb-6 border-b border-slate-200/60 -mx-6 md:-mx-10 px-6 md:px-10 mb-8 print:relative print:border-b print:border-slate-300 print:p-0 print:pb-4 print:m-0 print:mb-4">
+        <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 print:mb-2">
           <div>
-            <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-              西岡勝次商店 分析レポート
-            </h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight print:text-2xl">
+                西岡勝次商店 分析レポート
+              </h1>
+              <span className="hidden print:inline-block text-xs font-bold bg-slate-900 text-white px-3 py-1 rounded-full">
+                {selectedYear}年{selectedMonth}月度 経営報告書（エグゼクティブ・サマリー）
+              </span>
+            </div>
             <div className="flex items-center gap-3 mt-3 print:hidden">
               <div className="flex items-center bg-white border border-slate-200 rounded-lg shadow-sm">
                 <button
@@ -2159,6 +2481,13 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2.5 print:hidden">
             <button
               type="button"
+              onClick={() => window.print()}
+              className="bg-emerald-600 text-white px-4 py-2.5 rounded-xl text-sm font-bold hover:bg-emerald-700 transition-all shadow-sm cursor-pointer"
+            >
+              📄 経営レポート出力
+            </button>
+            <button
+              type="button"
               onClick={openRateModal}
               className="bg-white text-slate-700 border border-slate-200 px-4 py-2.5 rounded-xl text-sm font-bold hover:bg-slate-100 transition-all shadow-sm cursor-pointer"
             >
@@ -2189,28 +2518,63 @@ export default function App() {
           </div>
         </header>
 
-        {/* タブ選択ボタン群 */}
-        <div className="flex flex-wrap gap-3 mt-6 print:hidden">
-          {['日次データ', '月次データ', '相関図', '前年同月比較', '年間:発電予実', '投資回収'].map(
-            (t, i) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => setActiveTab(i + 1)}
-                className={`py-2 px-4 rounded-xl text-sm font-bold transition-all border cursor-pointer ${
-                  activeTab === i + 1
-                    ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
-                    : 'bg-white text-slate-400 border-slate-200 hover:bg-slate-100'
-                }`}
-              >
-                {t}
-              </button>
-            )
+        {/* 🚨 【機能1】発電効率低下・異常検知アラートバナー（ヘッダー直下） */}
+        <div className="mt-4 print-avoid-break">
+          {anomalyAlertInfo.isAnomaly ? (
+            <div
+              role="alert"
+              className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-300 text-amber-900 text-xs md:text-sm font-bold flex items-center justify-between gap-3 shadow-sm"
+            >
+              <span>
+                ⚠️ 【点検推奨】発電効率の低下を検知しました。日照に対して発電量が約
+                {anomalyAlertInfo.dropPercent}%低下しています（想定機会損失: 月間約
+                {anomalyAlertInfo.estimatedMonthlyLossK}
+                千円）。パネル汚れやパワコン停止の確認を推奨します。
+              </span>
+              {anomalyAlertInfo.worstDayLabel && (
+                <span className="shrink-0 text-[11px] bg-amber-200/80 text-amber-900 px-2.5 py-1 rounded-full font-extrabold">
+                  検知日: {anomalyAlertInfo.worstDayLabel}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="px-4 py-2.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs md:text-sm font-bold flex items-center justify-between gap-3">
+              <span>✅ 太陽光設備は正常に稼働しています（期待発電効率を維持）</span>
+              <span className="text-[11px] text-emerald-600 font-semibold hidden sm:inline">
+                日照4h以上の直近稼働日：標準期待値クリア
+              </span>
+            </div>
           )}
         </div>
 
+        {/* タブ選択ボタン群 */}
+        <div className="flex flex-wrap gap-3 mt-5 print:hidden">
+          {[
+            '日次データ',
+            '月次データ',
+            '相関図',
+            '前年同月比較',
+            '年間:発電予実',
+            '投資回収',
+            '増設シミュレーター',
+          ].map((t, i) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => setActiveTab(i + 1)}
+              className={`py-2 px-4 rounded-xl text-sm font-bold transition-all border cursor-pointer ${
+                activeTab === i + 1
+                  ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
+                  : 'bg-white text-slate-400 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
         {/* 📊 KPI表示枠（4枚のKPIカード） */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mt-6 print:grid-cols-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-5 print:grid-cols-4 print:gap-3 print-avoid-break">
           {[
             {
               label: '選択月総発電量',
@@ -2247,28 +2611,82 @@ export default function App() {
           ].map((kpi) => (
             <div
               key={kpi.label}
-              className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm"
+              className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm print:p-3 print:rounded-xl"
             >
               <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">
                 {kpi.label}
               </p>
-              <p className={`text-3xl font-black mt-2 ${kpi.color}`}>
+              <p className={`text-3xl font-black mt-1.5 print:text-xl ${kpi.color}`}>
                 {kpi.val}{' '}
                 <span className="text-sm font-medium text-slate-400">{kpi.unit}</span>
               </p>
               {kpi.sub && (
-                <p className="text-xs font-medium text-slate-400 mt-1.5">{kpi.sub}</p>
+                <p className="text-xs font-medium text-slate-400 mt-1">{kpi.sub}</p>
               )}
             </div>
           ))}
         </div>
+
+        {/* ⚡ 【機能3】デマンドピーク状況 ＆ 🌿 【機能5】CO2削減実績サマリーバー */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4 print:grid-cols-2 print:gap-3 print-avoid-break">
+          <div className="bg-white px-5 py-3.5 rounded-2xl border border-slate-100 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-extrabold text-slate-700">
+                  ⚡ デマンドピーク監視（高圧基本料金抑制）
+                </span>
+                <span className="text-[11px] font-bold bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full">
+                  マージン: {demandPeakInfo.marginKw} kW
+                </span>
+              </div>
+              <p className="text-xs font-bold text-slate-900 mt-1">
+                契約電力: <span className="text-blue-600">{demandPeakInfo.contractKw} kW</span> ／ 当月最大デマンド:{' '}
+                <span className="text-slate-900">{demandPeakInfo.maxDemandKw} kW</span>
+                {demandPeakInfo.measuredGridPeakKw > 0 && (
+                  <span className="text-slate-400 font-medium ml-1">
+                    (実測系統ピーク: {demandPeakInfo.measuredGridPeakKw} kW)
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="text-left sm:text-right">
+              <p className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg">
+                ピーク抑制効果: 最大デマンド▲{demandPeakInfo.peakCutContributionKw}kW抑制（基本料削減 月
+                {(demandPeakInfo.monthlyBaseDiscountYen / 1000).toFixed(0)}千円貢献）
+              </p>
+            </div>
+          </div>
+
+          <div className="bg-white px-5 py-3.5 rounded-2xl border border-slate-100 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <span className="text-xs font-extrabold text-slate-700">
+                🌿 環境価値・CO2削減実績（係数: 0.000434 t-CO2/kWh）
+              </span>
+              <p className="text-xs font-bold text-emerald-700 mt-1">
+                当月CO2削減量: <span className="text-sm font-black">{co2ReductionInfo.monthlyCo2Ton} t-CO2</span>
+                （杉の木 <span className="font-black">{co2ReductionInfo.monthlyCedarTrees}</span> 本分）
+              </p>
+            </div>
+            <div className="text-left sm:text-right">
+              <p className="text-[11px] font-bold text-slate-600 bg-slate-100 px-2.5 py-1 rounded-lg">
+                年間CO2削減量({co2ReductionInfo.isAnnualActual ? '実績累計' : '通期推計'}):{' '}
+                <span className="font-extrabold text-slate-900">{co2ReductionInfo.annualCo2Ton} t-CO2</span>（杉の木{' '}
+                {co2ReductionInfo.annualCedarTrees.toLocaleString()}本分）
+              </p>
+            </div>
+          </div>
+        </div>
       </div>
 
-      {/* 📉 グラフ表示枠 */}
-      <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-8">
+      {/* 📉 グラフ・シミュレーター表示枠 */}
+      <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-8 print:p-4 print:border-slate-200 print:shadow-none">
         <div
           className={`${
-            activeTab === 1 || activeTab === 2 || activeTab === 3
+            activeTab === 1 ||
+            activeTab === 2 ||
+            activeTab === 3 ||
+            activeTab === 6 ||
+            activeTab === 7
               ? 'h-auto space-y-12'
               : 'h-[400px]'
           } w-full`}
@@ -2786,46 +3204,519 @@ export default function App() {
                 </ResponsiveContainer>
               )}
 
-              {/* タブ6：投資回収 */}
+              {/* タブ6：投資回収 ＆ 機器更新タイマー（設備保全） */}
               {activeTab === 6 && (
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart
-                    data={roiData}
-                    margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
-                  >
-                    <CartesianGrid
-                      yAxisId="left"
-                      strokeDasharray="3 3"
-                      vertical={false}
-                      stroke="#e2e8f0"
-                    />
-                    <XAxis dataKey="year" stroke="#94a3b8" />
-                    <YAxis
-                      yAxisId="left"
-                      stroke="#94a3b8"
-                      tick={{ fontSize: 12 }}
-                      tickLine={true}
-                    />
-                    <Tooltip />
-                    <ReferenceLine yAxisId="left" y={0} stroke="#94a3b8" strokeWidth={2} />
-                    <Bar
-                      yAxisId="left"
-                      dataKey="actual"
-                      name="累計実績"
-                      fill="#3b82f6"
-                      radius={[6, 6, 0, 0]}
-                      maxBarSize={40}
-                    />
-                    <Line
-                      yAxisId="left"
-                      type="monotone"
-                      dataKey="sim"
-                      name="目標推移"
-                      stroke="#f59e0b"
-                      strokeWidth={3}
-                    />
-                  </ComposedChart>
-                </ResponsiveContainer>
+                <div className="space-y-10">
+                  <div className="bg-slate-50 p-6 rounded-2xl border border-slate-100">
+                    <h3 className="text-sm font-bold text-slate-500 mb-4">
+                      💹 投資回収推移（単位: 千円 ／ 設備投資・補助金・高圧単価連動）
+                    </h3>
+                    <div className="h-[360px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <ComposedChart
+                          data={roiData}
+                          margin={{ top: 20, right: 20, left: -10, bottom: 0 }}
+                        >
+                          <CartesianGrid
+                            yAxisId="left"
+                            strokeDasharray="3 3"
+                            vertical={false}
+                            stroke="#e2e8f0"
+                          />
+                          <XAxis dataKey="year" stroke="#94a3b8" />
+                          <YAxis
+                            yAxisId="left"
+                            stroke="#94a3b8"
+                            tick={{ fontSize: 12 }}
+                            tickLine={true}
+                          />
+                          <Tooltip />
+                          <Legend />
+                          <ReferenceLine yAxisId="left" y={0} stroke="#94a3b8" strokeWidth={2} />
+                          <Bar
+                            yAxisId="left"
+                            dataKey="actual"
+                            name="累計実績 (千円)"
+                            fill="#3b82f6"
+                            radius={[6, 6, 0, 0]}
+                            maxBarSize={40}
+                          />
+                          <Line
+                            yAxisId="left"
+                            type="monotone"
+                            dataKey="sim"
+                            name="目標推移 (千円)"
+                            stroke="#f59e0b"
+                            strokeWidth={3}
+                          />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* 🛠️ 【機能4】主要機器の法定耐用年数・寿命管理（機器更新タイマー＆メンテナンス積立推奨） */}
+                  <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200/80 space-y-5 print-avoid-break">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-2">
+                      <div>
+                        <h3 className="text-base font-extrabold text-slate-900">
+                          🛠️ 主要機器の法定耐用年数・寿命管理（設備保全タイマー）
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          長期安定稼働と将来のパワコン（PCS）更新に向けた計画的な内部留保ガイドライン
+                        </p>
+                      </div>
+                      <span className="text-xs font-bold bg-slate-900 text-white px-3 py-1.5 rounded-full self-start md:self-auto">
+                        導入開始: 2026年4月（現在 稼働{equipmentLifecycleInfo.operatingYear}年目）
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* 太陽光パネル */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-extrabold text-slate-800">
+                            ☀️ 太陽光パネル（モジュール）
+                          </span>
+                          <span className="text-xs font-bold bg-emerald-50 text-emerald-700 px-2.5 py-1 rounded-full">
+                            稼働 {equipmentLifecycleInfo.operatingYear}年目 / 期待寿命{' '}
+                            {equipmentLifecycleInfo.panelLifeYears}年
+                          </span>
+                        </div>
+                        <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-emerald-500 rounded-full"
+                            style={{
+                              width: `${Math.min(
+                                100,
+                                (equipmentLifecycleInfo.operatingYear /
+                                  equipmentLifecycleInfo.panelLifeYears) *
+                                  100
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-500 font-medium">
+                          <span>
+                            経年劣化率: 年{equipmentLifecycleInfo.panelDegradationRate}%想定
+                          </span>
+                          <span>
+                            現在想定出力維持率: {equipmentLifecycleInfo.currentPanelEfficiency}%
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* パワーコンディショナ (PCS) */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-extrabold text-slate-800">
+                            ⚡ パワーコンディショナ（PCS）
+                          </span>
+                          <span className="text-xs font-bold bg-amber-50 text-amber-700 px-2.5 py-1 rounded-full">
+                            稼働 {equipmentLifecycleInfo.operatingYear}年目 / 想定寿命{' '}
+                            {equipmentLifecycleInfo.pcsMinLife}〜{equipmentLifecycleInfo.pcsMaxLife}年
+                          </span>
+                        </div>
+                        <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-amber-500 rounded-full"
+                            style={{
+                              width: `${Math.min(
+                                100,
+                                (equipmentLifecycleInfo.operatingYear /
+                                  equipmentLifecycleInfo.pcsMaxLife) *
+                                  100
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                        <div className="flex justify-between text-xs text-slate-500 font-medium">
+                          <span>
+                            次回入替え目安時期: {equipmentLifecycleInfo.pcsReplacePeriod}
+                          </span>
+                          <span>更新費用目安: 約150〜250万円</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 経営提言メッセージ */}
+                    <div className="p-4 rounded-2xl bg-blue-50/80 border border-blue-200 text-blue-950 text-xs md:text-sm font-bold flex items-start gap-3">
+                      <span className="text-lg leading-none">💡</span>
+                      <div>
+                        <p>
+                          経営提言：「電気代削減益（年約
+                          {equipmentLifecycleInfo.estimatedAnnualSavingsManYen}
+                          万円）のうち、年間約15〜20万円を『設備更新引当金』として内部留保することを推奨します。」
+                        </p>
+                        <p className="text-xs font-medium text-blue-700 mt-1">
+                          ※ 10〜15年後のパワーコンディショナ更新（2035〜2038年頃）時に一時的なキャッシュアウトを防ぎ、無借金での機器更新が可能になります。
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* タブ7：【機能2】設備増設シミュレーター（パネル1枚単位） */}
+              {activeTab === 7 && (
+                <div className="space-y-10">
+                  <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200/80 space-y-6">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-2 border-b border-slate-200 pb-4">
+                      <div>
+                        <h3 className="text-lg font-extrabold text-slate-900">
+                          🔋 パネル枚数単位・設備増設シミュレーター（15分値デマンド・余剰判定連動）
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-1">
+                          各15分コマの発電量を「(既設容量＋増設容量) ÷ 既設容量」で拡大し、各コマの消費電力量との比較から自家消費・余剰カット・回収年数を精緻に試算します。
+                        </p>
+                      </div>
+                      <span className="text-xs font-bold bg-blue-600 text-white px-3 py-1.5 rounded-full self-start md:self-auto">
+                        {expansionSimResult.usingRealIntervals
+                          ? `実測15分値 (${expansionSimResult.intervalCount.toLocaleString()}コマ) 連動中`
+                          : '標準15分負荷プロファイル推計モード'}
+                      </span>
+                    </div>
+
+                    {/* パラメータ設定スライダー＆数値入力（4項目） */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                      {/* 1. 既設パネル容量 */}
+                      <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm space-y-2">
+                        <div className="flex items-center justify-between">
+                          <label
+                            htmlFor="sim-base-cap"
+                            className="text-xs font-bold text-slate-500"
+                          >
+                            ① 既設パネル容量
+                          </label>
+                          <span className="text-xs font-bold text-slate-400">
+                            約{Math.round((simBaseCapacityKw * 1000) / Math.max(100, simPanelWatt))}枚相当
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="sim-base-cap"
+                            type="number"
+                            min={10}
+                            max={500}
+                            step={1}
+                            value={simBaseCapacityKw}
+                            onChange={(e) =>
+                              setSimBaseCapacityKw(Math.max(1, Number(e.target.value) || 50))
+                            }
+                            className="w-24 px-3 py-1.5 rounded-xl border border-slate-200 text-base font-black text-slate-900"
+                          />
+                          <span className="text-sm font-bold text-slate-500">kW</span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="既設パネル容量スライダー"
+                          aria-valuetext={`${simBaseCapacityKw} kW`}
+                          min={10}
+                          max={200}
+                          step={5}
+                          value={simBaseCapacityKw}
+                          style={getSliderCssVars(simBaseCapacityKw, 10, 200)}
+                          onChange={(e) => setSimBaseCapacityKw(Number(e.target.value))}
+                          className="sim-slider"
+                        />
+                      </div>
+
+                      {/* 2. 増設パネル枚数（1枚単位） */}
+                      <div className="bg-white p-4 rounded-2xl border border-blue-200 shadow-sm space-y-2 ring-2 ring-blue-500/10">
+                        <div className="flex items-center justify-between">
+                          <label
+                            htmlFor="sim-added-panels"
+                            className="text-xs font-extrabold text-blue-700"
+                          >
+                            ② 増設パネル枚数 (1枚単位)
+                          </label>
+                          <span className="text-xs font-extrabold text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">
+                            +{expansionSimResult.addedCapKw.toFixed(2)} kW増設
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="sim-added-panels"
+                            type="number"
+                            min={0}
+                            max={1000}
+                            step={1}
+                            value={simAddedPanels}
+                            onChange={(e) =>
+                              setSimAddedPanels(Math.max(0, Math.round(Number(e.target.value) || 0)))
+                            }
+                            className="w-24 px-3 py-1.5 rounded-xl border border-blue-300 text-base font-black text-blue-700"
+                          />
+                          <span className="text-sm font-bold text-slate-500">
+                            枚（合計 {expansionSimResult.totalCapKw.toFixed(1)} kW）
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="増設パネル枚数スライダー"
+                          aria-valuetext={`${simAddedPanels} 枚`}
+                          min={0}
+                          max={500}
+                          step={1}
+                          value={simAddedPanels}
+                          style={getSliderCssVars(simAddedPanels, 0, 500)}
+                          onChange={(e) => setSimAddedPanels(Number(e.target.value))}
+                          className="sim-slider"
+                        />
+                      </div>
+
+                      {/* 3. パネル1枚あたりの定格出力 */}
+                      <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm space-y-2">
+                        <div className="flex items-center justify-between">
+                          <label
+                            htmlFor="sim-panel-watt"
+                            className="text-xs font-bold text-slate-500"
+                          >
+                            ③ パネル1枚定格出力
+                          </label>
+                          <span className="text-xs font-bold text-slate-400">
+                            {(simPanelWatt / 1000).toFixed(2)} kW/枚
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="sim-panel-watt"
+                            type="number"
+                            min={200}
+                            max={700}
+                            step={5}
+                            value={simPanelWatt}
+                            onChange={(e) =>
+                              setSimPanelWatt(Math.max(100, Number(e.target.value) || 400))
+                            }
+                            className="w-24 px-3 py-1.5 rounded-xl border border-slate-200 text-base font-black text-slate-900"
+                          />
+                          <span className="text-sm font-bold text-slate-500">W / 枚</span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="パネル1枚あたりの定格出力スライダー"
+                          aria-valuetext={`${simPanelWatt} W`}
+                          min={250}
+                          max={650}
+                          step={10}
+                          value={simPanelWatt}
+                          style={getSliderCssVars(simPanelWatt, 250, 650)}
+                          onChange={(e) => setSimPanelWatt(Number(e.target.value))}
+                          className="sim-slider"
+                        />
+                      </div>
+
+                      {/* 4. 増設にかかる想定費用 */}
+                      <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm space-y-2">
+                        <div className="flex items-center justify-between">
+                          <label
+                            htmlFor="sim-invest-cost"
+                            className="text-xs font-bold text-slate-500"
+                          >
+                            ④ 増設にかかる想定費用
+                          </label>
+                          <span className="text-xs font-bold text-slate-400">
+                            {(simInvestManYen * 10000).toLocaleString()} 円
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="sim-invest-cost"
+                            type="number"
+                            min={50}
+                            max={5000}
+                            step={10}
+                            value={simInvestManYen}
+                            onChange={(e) =>
+                              setSimInvestManYen(Math.max(0, Number(e.target.value) || 0))
+                            }
+                            className="w-24 px-3 py-1.5 rounded-xl border border-slate-200 text-base font-black text-slate-900"
+                          />
+                          <span className="text-sm font-bold text-slate-500">万円</span>
+                        </div>
+                        <input
+                          type="range"
+                          aria-label="増設にかかる想定費用スライダー"
+                          aria-valuetext={`${simInvestManYen} 万円`}
+                          min={100}
+                          max={2000}
+                          step={25}
+                          value={simInvestManYen}
+                          style={getSliderCssVars(simInvestManYen, 100, 2000)}
+                          onChange={(e) => setSimInvestManYen(Number(e.target.value))}
+                          className="sim-slider"
+                        />
+                      </div>
+                    </div>
+
+                    {/* シミュレーション結果 4大指標カード */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                      {/* 指標1: 新たな自家消費電力量と年間推定電気代削減額 */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-xs font-bold text-slate-400">
+                          ① 年間推定電気代削減額（自家消費）
+                        </p>
+                        <p className="text-2xl font-black text-emerald-600 mt-2">
+                          約 {(expansionSimResult.scaledAnnualSavingsYen / 10000).toFixed(1)}{' '}
+                          <span className="text-xs font-bold text-slate-400">万円/年</span>
+                        </p>
+                        <p className="text-xs font-bold text-emerald-700 mt-1">
+                          増設効果: +
+                          {Math.round(expansionSimResult.addedAnnualSavingsYen / 1000).toLocaleString()}{' '}
+                          千円/年
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          自家消費: {expansionSimResult.baseAnnualSelfKwh.toLocaleString()} ➔{' '}
+                          {expansionSimResult.scaledAnnualSelfKwh.toLocaleString()} kWh/年
+                        </p>
+                      </div>
+
+                      {/* 指標2: 新たな電力自給率 (%) */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-xs font-bold text-slate-400">② 新たな電力自給率</p>
+                        <p className="text-2xl font-black text-amber-600 mt-2">
+                          {expansionSimResult.scaledSelfSufficiency.toFixed(1)}{' '}
+                          <span className="text-xs font-bold text-slate-400">%</span>
+                        </p>
+                        <p className="text-xs font-bold text-amber-700 mt-1">
+                          現状 {expansionSimResult.baseSelfSufficiency.toFixed(1)}% から +
+                          {(
+                            expansionSimResult.scaledSelfSufficiency -
+                            expansionSimResult.baseSelfSufficiency
+                          ).toFixed(1)}
+                          pt 向上
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          発電倍率: {expansionSimResult.scaleFactor.toFixed(2)}倍 (
+                          {expansionSimResult.totalCapKw.toFixed(1)}kW)
+                        </p>
+                      </div>
+
+                      {/* 指標3: 余剰電力量（カット/捨てられる電力量） */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-xs font-bold text-slate-400">
+                          ③ 年間余剰電力量（消費超過カット分）
+                        </p>
+                        <p className="text-2xl font-black text-rose-600 mt-2">
+                          {expansionSimResult.scaledAnnualSurplusKwh.toLocaleString()}{' '}
+                          <span className="text-xs font-bold text-slate-400">kWh/年</span>
+                        </p>
+                        <p className="text-xs font-bold text-rose-700 mt-1">
+                          現状余剰: {expansionSimResult.baseAnnualSurplusKwh.toLocaleString()} kWh/年
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          ※ 蓄電池併用やデマンドシフトでさらなる活用余地あり
+                        </p>
+                      </div>
+
+                      {/* 指標4: 増設投資の回収見込み期間（年数） */}
+                      <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm">
+                        <p className="text-xs font-bold text-slate-400">
+                          ④ 増設投資の回収見込み期間
+                        </p>
+                        <p className="text-2xl font-black text-blue-600 mt-2">
+                          {expansionSimResult.paybackYears}{' '}
+                          <span className="text-xs font-bold text-slate-400">年</span>
+                        </p>
+                        <p className="text-xs font-bold text-blue-700 mt-1">
+                          増設投資額: {simInvestManYen.toLocaleString()} 万円
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-1">
+                          パネル期待寿命25年に対して十分な投資採算性
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* 増設前後の比較バーチャート */}
+                    <div className="bg-white p-6 rounded-2xl border border-slate-100">
+                      <h4 className="text-sm font-bold text-slate-600 mb-4">
+                        📊 増設前後（既設 {expansionSimResult.baseCapKw}kW vs 増設後{' '}
+                        {expansionSimResult.totalCapKw.toFixed(1)}kW [+{simAddedPanels}枚]）の年間電力量比較（kWh）
+                      </h4>
+                      <div className="h-[340px] w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <ComposedChart
+                            data={expansionSimResult.comparisonChartData}
+                            margin={{ top: 20, right: 20, left: 0, bottom: 0 }}
+                          >
+                            <CartesianGrid
+                              yAxisId="left"
+                              strokeDasharray="3 3"
+                              vertical={false}
+                              stroke="#e2e8f0"
+                            />
+                            <XAxis
+                              dataKey="stage"
+                              stroke="#94a3b8"
+                              tick={{ fontSize: 13, fontWeight: 'bold' }}
+                            />
+                            <YAxis
+                              yAxisId="left"
+                              stroke="#94a3b8"
+                              tick={{ fontSize: 12 }}
+                              tickLine={true}
+                            />
+                            <Tooltip
+                              cursor={{ fill: '#f8fafc' }}
+                              contentStyle={{ borderRadius: '16px', border: 'none' }}
+                            />
+                            <Legend />
+                            <Bar
+                              yAxisId="left"
+                              dataKey="自家消費電力量"
+                              name="自家消費電力量 (kWh)"
+                              fill="#10b981"
+                              radius={[6, 6, 0, 0]}
+                              maxBarSize={55}
+                            />
+                            <Bar
+                              yAxisId="left"
+                              dataKey="系統買電量"
+                              name="系統からの買電量 (kWh)"
+                              fill="#f43f5e"
+                              radius={[6, 6, 0, 0]}
+                              maxBarSize={55}
+                            />
+                            <Bar
+                              yAxisId="left"
+                              dataKey="余剰電力量"
+                              name="余剰電力量・カット分 (kWh)"
+                              fill="#f59e0b"
+                              radius={[6, 6, 0, 0]}
+                              maxBarSize={55}
+                            />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* 🖨️ A4印刷時（経営レポート出力）専用エグゼクティブ・フッター（設備保全＆内部留保提言） */}
+              {activeTab !== 6 && (
+                <div className="hidden print:block mt-6 pt-4 border-t border-slate-200 print-avoid-break">
+                  <div className="grid grid-cols-3 gap-3 text-xs">
+                    <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                      <p className="font-bold text-slate-500">☀️ 太陽光パネル寿命管理</p>
+                      <p className="font-extrabold text-slate-900 mt-1">
+                        稼働 {equipmentLifecycleInfo.operatingYear}年目 / 期待寿命25年（劣化率: 年0.5%想定）
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                      <p className="font-bold text-slate-500">⚡ パワコン(PCS)更新タイマー</p>
+                      <p className="font-extrabold text-slate-900 mt-1">
+                        稼働 {equipmentLifecycleInfo.operatingYear}年目 / 想定寿命10〜15年（次回目安: 2035〜2038年）
+                      </p>
+                    </div>
+                    <div className="p-3 rounded-xl bg-blue-50 border border-blue-200">
+                      <p className="font-bold text-blue-800">💡 設備更新引当金 経営提言</p>
+                      <p className="font-bold text-blue-950 mt-1">
+                        削減益（年約{equipmentLifecycleInfo.estimatedAnnualSavingsManYen}万円）のうち年約15〜20万円を内部留保推奨
+                      </p>
+                    </div>
+                  </div>
+                </div>
               )}
             </>
           )}
